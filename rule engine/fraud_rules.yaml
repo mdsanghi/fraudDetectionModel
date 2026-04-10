@@ -189,3 +189,13 @@ rules:
     source_sheet: Transactions+Login_History
     required_features:
       - recent_mfa_used
+
+  - id: R21
+    name: new_customer_recent_registration
+    description: Customer account was registered within the last 10 days
+    severity: high
+    score: 25
+    when: account_age_days <= 10
+    source_sheet: Customers
+    required_features:
+      - account_age_days

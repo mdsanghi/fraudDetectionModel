@@ -1,31 +1,32 @@
 """
 Fraud Detection — Real-Time Prediction Module
 ==============================================
-Loads the frozen XGBoost model from xgb_fraud_model.json.
-Label encoders are read directly from model_metadata.json (no joblib needed).
+Composite scoring:
+    composite_score = 0.60 x ml_score  +  0.40 x yaml_score_normalised
 
-MINIMUM INPUT — caller only needs to provide:
-    customer_id       : str   — must exist in Customers sheet
-    beneficiary_id    : str   — must exist in Beneficiaries sheet
-    amount_usd        : float — transfer amount
-    transaction_type  : str   — "Wire Transfer" | "Bill Payment" | "Peer Transfer" | "Top-Up" | "Withdrawal"
-    channel           : str   — "Mobile App" | "Web Browser" | "ATM" | "Branch"
-    device_used       : str   — current device name
+Where:
+    ml_score              = XGBoost probability * 100  (0-100)
+    yaml_score_normalised = (sum of fired rule scores / max possible score) * 100
+    composite_score       = 0-100
 
-ALL other fraud signals are computed automatically:
-    beneficiary_nationality  <- looked up from Beneficiaries sheet
-    is_cross_nationality     <- customer.nationality != beneficiary.nationality
-    customer_avg_amount      <- customer.typical_txn_amount
-    amount_vs_avg_ratio      <- amount_usd / customer_avg_amount
-    is_new_device            <- device_used != customer.primary_device
-    is_new_beneficiary       <- beneficiary_id not in customer's past transactions
-    is_high_risk_country     <- beneficiary nationality in {NG, RU, CN, BD}
-    login_attempts_before    <- failed logins in last 24h from login history
-    transaction_hour         <- from transaction_date (defaults to now)
-    is_unusual_hour          <- transaction_hour in 0-4
+Risk levels (applied to composite_score):
+    Low    <  30
+    Medium  30-69
+    High   >= 70
+
+Safety net — ALWAYS raises High alarm if:
+    (a) composite_score >= 70, OR
+    (b) yaml_score_raw  >= 70  (high YAML evidence even if ML is uncertain), OR
+    (c) any CRITICAL rule fires (R03, R08, R16, R20)
+
+MINIMUM CALLER INPUT:
+    customer_id, beneficiary_id, amount_usd,
+    transaction_type, channel, device_used
+    (transaction_date optional — defaults to now)
 """
 
 import os
+import re
 import json
 import warnings
 from datetime import datetime, timedelta
@@ -34,10 +35,26 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
 warnings.filterwarnings("ignore")
 
-RISK_THRESHOLDS         = {"low_max": 29, "medium_max": 69, "high_min": 70}
+# ── Thresholds ─────────────────────────────────────────────────────────────────
+COMPOSITE_LOW    = 30
+COMPOSITE_MEDIUM = 69
+COMPOSITE_HIGH   = 70
+
+# Raw YAML score above this always triggers High regardless of ML
+YAML_HIGH_FLOOR  = 70
+
 HIGH_RISK_NATIONALITIES = {"NG", "RU", "CN", "BD"}
+
+# Rules tagged critical — any single fire forces High alarm
+CRITICAL_RULE_IDS = {"R03", "R08", "R16", "R20"}
 
 DROP_COLS = [
     "transaction_id", "customer_id", "beneficiary_id",
@@ -49,16 +66,136 @@ DROP_COLS = [
 ]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# YAML Rule Engine
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_rules(yaml_path: str) -> list:
+    """Load rules from fraud_rules.yaml. Falls back to built-in rules if yaml unavailable."""
+    if not os.path.exists(yaml_path):
+        return []
+    if _YAML_AVAILABLE:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+        return data.get("rules", [])
+    # Fallback: parse YAML manually for simple key:value structure
+    rules = []
+    current = {}
+    with open(yaml_path) as f:
+        in_rules = False
+        for line in f:
+            stripped = line.strip()
+            if stripped == "rules:":
+                in_rules = True
+                continue
+            if not in_rules:
+                continue
+            if stripped.startswith("- id:"):
+                if current:
+                    rules.append(current)
+                current = {"id": stripped.split(":", 1)[1].strip()}
+            elif ":" in stripped and not stripped.startswith("#"):
+                k, v = stripped.split(":", 1)
+                k, v = k.strip(), v.strip()
+                if k in ("score",):
+                    try:
+                        current[k] = int(v)
+                    except ValueError:
+                        current[k] = v
+                else:
+                    current[k] = v
+    if current:
+        rules.append(current)
+    return rules
+
+
+def _eval_rule(when_clause: str, ctx: dict) -> bool:
+    """
+    Evaluate a YAML 'when' clause against a context dict.
+    Supports: ==, !=, >=, <=, >, <, 'and', 'or', true/false, quoted strings.
+    """
+    # Normalise booleans and string literals
+    expr = when_clause.strip()
+    expr = re.sub(r'\btrue\b',  '1', expr, flags=re.IGNORECASE)
+    expr = re.sub(r'\bfalse\b', '0', expr, flags=re.IGNORECASE)
+    expr = re.sub(r'\band\b',   ' and ', expr, flags=re.IGNORECASE)
+    expr = re.sub(r'\bor\b',    ' or ',  expr, flags=re.IGNORECASE)
+
+    # Build a safe eval namespace from the context
+    ns = {}
+    for k, v in ctx.items():
+        if isinstance(v, (int, float, bool)):
+            ns[k] = v
+        elif isinstance(v, str):
+            ns[k] = v
+        else:
+            try:
+                ns[k] = float(v)
+            except (TypeError, ValueError):
+                ns[k] = str(v) if v is not None else ""
+
+    try:
+        return bool(eval(expr, {"__builtins__": {}}, ns))  # noqa: S307
+    except Exception:
+        return False
+
+
+def evaluate_yaml_rules(rules: list, ctx: dict) -> tuple:
+    """
+    Evaluate all rules against context dict.
+    Returns:
+        fired_rules     : list of dicts  {id, name, score, severity}
+        yaml_score_raw  : int  (sum of fired rule scores)
+        max_score       : int  (sum of all rule scores — used for normalisation)
+        critical_fired  : bool (any CRITICAL rule triggered)
+    """
+    fired       = []
+    total_score = 0
+    max_score   = sum(r.get("score", 0) for r in rules)
+    critical    = False
+
+    for rule in rules:
+        rid   = rule.get("id", "")
+        when  = rule.get("when", "")
+        score = int(rule.get("score", 0))
+        sev   = rule.get("severity", "medium")
+        name  = rule.get("name", rid)
+
+        if not when:
+            continue
+
+        try:
+            triggered = _eval_rule(when, ctx)
+        except Exception:
+            triggered = False
+
+        if triggered:
+            fired.append({"id": rid, "name": name, "score": score, "severity": sev})
+            total_score += score
+            if rid in CRITICAL_RULE_IDS:
+                critical = True
+
+    return fired, total_score, max_score, critical
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FraudPredictor
+# ══════════════════════════════════════════════════════════════════════════════
+
 class FraudPredictor:
     """
-    Loads model + reference data once.
-    score_transaction() accepts only 6 required inputs — everything else is derived.
+    Composite fraud scorer:
+        composite_score = 0.60 * ml_score + 0.40 * yaml_normalised
+    Minimum caller input: customer_id, beneficiary_id, amount_usd,
+                          transaction_type, channel, device_used
     """
 
-    def __init__(self, model_dir: str = None, data_path: str = None):
+    def __init__(self, model_dir: str = None, data_path: str = None,
+                 rules_path: str = None):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cwd        = os.getcwd()
 
+        # ── Resolve model dir ──────────────────────────────────────────────────
         search_model = [d for d in [model_dir, script_dir, cwd,
                          os.path.join(cwd, "output"),
                          os.path.join(script_dir, "output")] if d]
@@ -69,22 +206,37 @@ class FraudPredictor:
             raise FileNotFoundError(
                 f"xgb_fraud_model.json not found. Searched: {search_model}")
 
+        # ── Resolve data path ──────────────────────────────────────────────────
         search_data = [d for d in [data_path, cwd, script_dir,
                         os.path.dirname(script_dir)] if d]
         resolved_data = next(
             (os.path.join(d, "fraud_detection_synthetic_data.xlsx")
              for d in search_data
-             if os.path.exists(os.path.join(d, "fraud_detection_synthetic_data.xlsx"))),
+             if os.path.exists(
+                 os.path.join(d, "fraud_detection_synthetic_data.xlsx"))),
             data_path if data_path and os.path.isfile(str(data_path)) else None)
         if not resolved_data:
-            raise FileNotFoundError("fraud_detection_synthetic_data.xlsx not found. Pass data_path=")
+            raise FileNotFoundError(
+                "fraud_detection_synthetic_data.xlsx not found. Pass data_path=")
 
-        # Load model
+        # ── Resolve YAML rules path ────────────────────────────────────────────
+        search_rules = [rules_path] if rules_path else []
+        search_rules += [script_dir, cwd,
+                         os.path.join(cwd, "output"),
+                         os.path.join(script_dir, "output"),
+                         os.path.join(cwd, "rule engine")]  # Add rule engine directory
+        resolved_rules = next(
+            (os.path.join(d, "fraud_rules.yaml")
+             for d in search_rules
+             if d and os.path.exists(os.path.join(d, "fraud_rules.yaml"))),
+            None)
+
+        # ── Load XGBoost model ─────────────────────────────────────────────────
         self.model = xgb.XGBClassifier()
         self.model.load_model(os.path.join(resolved_model_dir, "xgb_fraud_model.json"))
-        print(f"  OK Model loaded")
+        print(f"  OK  XGBoost model loaded")
 
-        # Load metadata + encoders from JSON (no joblib)
+        # ── Load metadata + label encoders ────────────────────────────────────
         with open(os.path.join(resolved_model_dir, "model_metadata.json")) as f:
             self.metadata = json.load(f)
         self.feature_order = self.metadata["features"]
@@ -92,9 +244,20 @@ class FraudPredictor:
             col: {str(c): i for i, c in enumerate(classes)}
             for col, classes in self.metadata.get("label_encoders", {}).items()
         }
-        print(f"  OK Label encoders: {len(self.label_encoders)} columns")
+        print(f"  OK  Label encoders: {len(self.label_encoders)} columns")
 
-        # Load Excel reference data
+        # ── Load YAML rules ────────────────────────────────────────────────────
+        if resolved_rules:
+            self.rules = _load_rules(resolved_rules)
+            self.max_yaml_score = sum(r.get("score", 0) for r in self.rules)
+            print(f"  OK  YAML rules: {len(self.rules)} rules loaded, "
+                  f"max score = {self.max_yaml_score}")
+        else:
+            self.rules = []
+            self.max_yaml_score = 1
+            print("  WARN  fraud_rules.yaml not found — YAML scoring disabled")
+
+        # ── Load reference Excel sheets ────────────────────────────────────────
         print(f"  Loading: {resolved_data}")
         xls = pd.ExcelFile(resolved_data)
         self.df_customers     = pd.read_excel(xls, "Customers")
@@ -102,14 +265,12 @@ class FraudPredictor:
         self.df_logins        = pd.read_excel(xls, "Login_History")
         self.df_transactions  = pd.read_excel(xls, "Transactions")
 
-        # Fast lookup dicts
         self._cust_map  = self.df_customers.set_index("customer_id").to_dict("index")
         self._bene_map  = self.df_beneficiaries.set_index("beneficiary_id").to_dict("index")
         self._cust_bene = (self.df_beneficiaries
                            .groupby("customer_id")["beneficiary_id"]
                            .apply(set).to_dict())
 
-        # Account age
         self.df_customers["registration_date"] = pd.to_datetime(
             self.df_customers["registration_date"], errors="coerce")
         for cid, row in self._cust_map.items():
@@ -122,11 +283,9 @@ class FraudPredictor:
         self._login_feats = self._build_login_features()
         self._bene_feats  = self._build_beneficiary_features()
 
-        print(f"  OK {len(self.df_customers)} customers | "
+        print(f"  OK  {len(self.df_customers)} customers | "
               f"{len(self.df_logins)} logins | "
-              f"{len(self.df_beneficiaries)} beneficiaries | "
-              f"{len(self.df_transactions)} transactions")
-        print(f"  OK Model expects {len(self.feature_order)} features\n")
+              f"{len(self.df_beneficiaries)} beneficiaries\n")
 
     # ── Pre-compute aggregates ─────────────────────────────────────────────────
 
@@ -145,13 +304,14 @@ class FraudPredictor:
         ).reset_index()
         agg["failed_login_rate"]     = agg["failed_logins"] / agg["total_logins"]
         agg["has_repeated_failures"] = (agg["failed_logins"] >= 3).astype(int)
-        last  = (df.sort_values("login_timestamp").groupby("customer_id")
-                   .agg(last_login_country=("location_country","last")).reset_index())
-        mode  = (df.groupby("customer_id")["location_country"]
-                   .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
-                   .reset_index().rename(columns={"location_country":"usual_login_country"}))
-        agg   = agg.merge(last, on="customer_id", how="left")
-        agg   = agg.merge(mode, on="customer_id", how="left")
+        last = (df.sort_values("login_timestamp").groupby("customer_id")
+                  .agg(last_login_country=("location_country","last")).reset_index())
+        mode = (df.groupby("customer_id")["location_country"]
+                  .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
+                  .reset_index()
+                  .rename(columns={"location_country":"usual_login_country"}))
+        agg = agg.merge(last, on="customer_id", how="left")
+        agg = agg.merge(mode, on="customer_id", how="left")
         agg["login_location_shift"] = (
             agg["last_login_country"] != agg["usual_login_country"]).astype(int)
         agg.drop(columns=["last_login_country","usual_login_country"], inplace=True)
@@ -201,8 +361,8 @@ class FraudPredictor:
         # Amount
         avg = float(cust.get("typical_txn_amount", 0) or 1)
         amt = float(txn.get("amount_usd", 0))
-        d["customer_avg_amount"] = avg
-        d["amount_vs_avg_ratio"] = round(amt / avg, 4) if avg > 0 else 1.0
+        d["customer_avg_amount"]  = avg
+        d["amount_vs_avg_ratio"]  = round(amt / avg, 4) if avg > 0 else 1.0
 
         # Device
         primary = str(cust.get("primary_device", ""))
@@ -232,44 +392,81 @@ class FraudPredictor:
         # Login attempts last 24 h
         if cid and len(self.df_logins) > 0:
             logs = self.df_logins[self.df_logins["customer_id"] == cid].copy()
-            logs["login_timestamp"] = pd.to_datetime(logs["login_timestamp"], errors="coerce")
+            logs["login_timestamp"] = pd.to_datetime(
+                logs["login_timestamp"], errors="coerce")
             cutoff = now - timedelta(hours=24)
-            d["login_attempts_before"] = int(
-                len(logs[(logs["login_timestamp"] >= cutoff) &
-                          (logs["login_status"] != "Success")]))
+            d["login_attempts_before"] = int(len(
+                logs[(logs["login_timestamp"] >= cutoff) &
+                     (logs["login_status"] != "Success")]))
         else:
             d["login_attempts_before"] = 0
+
+        # Recent login location shift
+        if cid and len(self.df_logins) > 0:
+            logs = self.df_logins[self.df_logins["customer_id"] == cid].copy()
+            logs["login_timestamp"] = pd.to_datetime(
+                logs["login_timestamp"], errors="coerce")
+            last_log = logs.sort_values("login_timestamp").iloc[-1] if len(logs) > 0 else None
+            d["recent_login_new_location"] = int(
+                last_log is not None and
+                bool(last_log.get("is_new_location", False))
+            )
+            # Recent MFA
+            d["recent_mfa_used"] = int(
+                last_log is not None and
+                bool(last_log.get("mfa_used", True))
+            )
+        else:
+            d["recent_login_new_location"] = 0
+            d["recent_mfa_used"]           = 1
 
         # Compound
         d["cross_nat_new_ben"] = int(
             d["is_cross_nationality"] == 1 and d["is_new_beneficiary"] == 1)
 
+        # Beneficiary age (days since added)
+        if bene:
+            added = bene.get("added_date", None)
+            if added:
+                try:
+                    added_dt = pd.to_datetime(str(added), errors="coerce")
+                    d["beneficiary_age_days"] = int((now - added_dt).days) if not pd.isna(added_dt) else 999
+                except Exception:
+                    d["beneficiary_age_days"] = 999
+            else:
+                d["beneficiary_age_days"] = 999
+        else:
+            d["beneficiary_age_days"] = 999
+
+        # Beneficiary verified flag for YAML rules
+        d["beneficiary_is_verified"] = int(bool(bene.get("is_verified", True))) if bene else 1
+
+        # Customer fields for YAML rules (mapped to YAML field names)
+        d["customer_risk_tier"]     = str(cust.get("risk_tier", "Low"))
+        d["customer_kyc_status"]    = str(cust.get("kyc_status", "Verified"))
+        d["customer_account_status"]= str(cust.get("account_status", "Active"))
+
         return d
 
-    # ── Build full feature vector ──────────────────────────────────────────────
+    # ── Build XGBoost feature vector ───────────────────────────────────────────
 
-    def _build_features(self, txn: dict):
+    def _build_features(self, txn: dict, derived: dict):
         cid  = txn.get("customer_id", "")
-        bid  = txn.get("beneficiary_id", "")
         cust = self._cust_map.get(cid, {})
-        bene = self._bene_map.get(bid, {})
-
-        derived = self._derive_flags(txn, cust, bene)
-
-        row = {}
+        row  = {}
         row.update(cust)
         row.update(txn)
-        row.update(derived)        # derived wins — highest priority
+        row.update(derived)    # derived wins
 
         df = pd.DataFrame([row])
 
-        # Merge login aggregates
+        # Login aggregates
         if cid in self._login_feats.index:
             for k, v in self._login_feats.loc[cid].to_dict().items():
                 if k not in df.columns:
                     df[k] = v
 
-        # Merge beneficiary aggregates
+        # Beneficiary aggregates
         if cid in self._bene_feats.index:
             for k, v in self._bene_feats.loc[cid].to_dict().items():
                 if k not in df.columns:
@@ -290,33 +487,25 @@ class FraudPredictor:
         df["spike_typical_2x"]        = int(amt / typ >= 2.0)
         df["spike_typical_5x"]        = int(amt / typ >= 5.0)
 
-        # Hour / night
         hr = int(df["transaction_hour"].iloc[0]) if "transaction_hour" in df.columns else 12
-        df["is_deep_night"] = int(hr in range(0, 5))
-
-        # Login attempts
+        df["is_deep_night"]       = int(hr in range(0, 5))
         attempts = int(df["login_attempts_before"].iloc[0]) if "login_attempts_before" in df.columns else 0
         df["high_login_attempts"] = int(attempts >= 3)
-
-        # MFA
-        df["high_value_txn"]  = int(amt > 400)
+        df["high_value_txn"]      = int(amt > 400)
         low_mfa = int(df["low_mfa_user"].iloc[0]) if "low_mfa_user" in df.columns else 0
-        df["no_mfa_high_value"] = int(low_mfa == 1 and amt > 400)
+        df["no_mfa_high_value"]   = int(low_mfa == 1 and amt > 400)
 
-        # Customer risk
         df["is_high_risk_customer"] = int(
             str(df["risk_tier"].iloc[0]).lower() == "high" if "risk_tier" in df.columns else False)
-        df["kyc_not_verified"] = int(
+        df["kyc_not_verified"]  = int(
             str(df["kyc_status"].iloc[0]).lower() != "verified" if "kyc_status" in df.columns else False)
         df["account_not_active"] = int(
             str(df["account_status"].iloc[0]).lower() != "active" if "account_status" in df.columns else False)
 
-        # Beneficiary risk combo
-        is_new = int(df["is_new_beneficiary"].iloc[0]) if "is_new_beneficiary" in df.columns else 0
-        has_unver = int(df["has_unverified_ben"].iloc[0]) if "has_unverified_ben" in df.columns else 0
-        df["new_unverified_ben"] = int(is_new == 1 and has_unver == 1)
+        is_new   = int(df["is_new_beneficiary"].iloc[0]) if "is_new_beneficiary" in df.columns else 0
+        has_unv  = int(df["has_unverified_ben"].iloc[0]) if "has_unverified_ben" in df.columns else 0
+        df["new_unverified_ben"] = int(is_new == 1 and has_unv == 1)
 
-        # Signal count
         rule_flags = [
             "spike_2x","is_new_device","is_new_beneficiary","cross_nat_new_ben",
             "is_high_risk_country","is_deep_night","high_login_attempts",
@@ -327,12 +516,10 @@ class FraudPredictor:
         df["fraud_signal_count"] = int(df[existing_flags].fillna(0).sum(axis=1).iloc[0])
         df["multi_signal_alert"] = int(df["fraud_signal_count"].iloc[0] >= 3)
 
-        # Drop ID/text cols
         for col in DROP_COLS:
             if col in df.columns:
                 df.drop(columns=[col], inplace=True)
 
-        # Datetime -> numeric
         for col in df.select_dtypes(include=["datetime64","datetimetz"]).columns:
             df[f"{col}_year"]      = df[col].dt.year
             df[f"{col}_month"]     = df[col].dt.month
@@ -341,7 +528,6 @@ class FraudPredictor:
             df[f"{col}_dayofweek"] = df[col].dt.dayofweek
             df.drop(columns=[col], inplace=True)
 
-        # Encode categoricals
         if "fraud_signal_count" in df.columns and "fraud_signal_count" in self.label_encoders:
             enc = self.label_encoders["fraud_signal_count"]
             val = str(int(df["fraud_signal_count"].iloc[0]))
@@ -352,21 +538,52 @@ class FraudPredictor:
                 continue
             if col not in df.columns:
                 continue
-            val = str(df[col].iloc[0])
-            df[col] = enc_dict.get(val, -1)
+            df[col] = enc_dict.get(str(df[col].iloc[0]), -1)
 
-        # Align to model feature order
         for feat in self.feature_order:
             if feat not in df.columns:
                 df[feat] = 0
         df = df[self.feature_order]
-
-        # Final clean
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
         return df, existing_flags
+
+    # ── Composite scoring ──────────────────────────────────────────────────────
+
+    def _composite_score(self, ml_score: float,
+                         yaml_score_raw: int, max_yaml: int) -> float:
+        """
+        composite = 0.60 * ml_score + 0.40 * yaml_normalised
+        ml_score        : 0-100
+        yaml_score_raw  : sum of fired rule scores
+        max_yaml        : sum of all rule scores (normalisation base)
+        """
+        yaml_norm = (yaml_score_raw / max_yaml * 100) if max_yaml > 0 else 0
+        return round(0.60 * ml_score + 0.40 * yaml_norm, 2)
+
+    def _risk_level(self, composite: float, yaml_raw: int,
+                    critical_fired: bool) -> tuple:
+        """
+        Determine final risk level.
+        Safety net ensures High is ALWAYS raised when:
+          (a) composite >= 70
+          (b) yaml_raw  >= YAML_HIGH_FLOOR  (strong rule evidence alone)
+          (c) any CRITICAL rule fired
+        Returns (risk_level, reason)
+        """
+        # Safety net checks first
+        if critical_fired:
+            return "High", "critical_rule_fired"
+        if yaml_raw >= YAML_HIGH_FLOOR:
+            return "High", "yaml_high_floor_exceeded"
+        # Normal composite thresholds
+        if composite >= COMPOSITE_HIGH:
+            return "High", "composite_score"
+        if composite >= COMPOSITE_LOW:
+            return "Medium", "composite_score"
+        return "Low", "composite_score"
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -374,121 +591,160 @@ class FraudPredictor:
         """
         Score a single transaction with minimal inputs.
 
-        Required keys:
-            customer_id, beneficiary_id, amount_usd,
-            transaction_type, channel, device_used
+        Required: customer_id, beneficiary_id, amount_usd,
+                  transaction_type, channel, device_used
+        Optional: transaction_date  (defaults to now)
 
-        Optional:
-            transaction_date  (defaults to now)
-
-        All fraud flags are derived automatically.
+        Returns full scoring breakdown including composite score,
+        ML score, YAML score, fired rules, and auto-derived flags.
         """
-        features_df, flag_cols = self._build_features(transaction)
-
-        probability = float(self.model.predict_proba(features_df)[0][1])
-        ml_score    = round(probability * 100, 1)
-
-        fired = [f for f in flag_cols
-                 if f in features_df.columns and features_df[f].iloc[0] == 1]
-
-        risk_level = (
-            "Low"    if ml_score <= RISK_THRESHOLDS["low_max"]    else
-            "Medium" if ml_score <= RISK_THRESHOLDS["medium_max"] else
-            "High"
-        )
-
         cid  = transaction.get("customer_id", "")
         bid  = transaction.get("beneficiary_id", "")
-        derived = self._derive_flags(
-            transaction,
-            self._cust_map.get(cid, {}),
-            self._bene_map.get(bid, {}),
-        )
+        cust = self._cust_map.get(cid, {})
+        bene = self._bene_map.get(bid, {})
+
+        # ── Step 1: Derive all flags automatically ─────────────────────────────
+        derived = self._derive_flags(transaction, cust, bene)
+
+        # ── Step 2: XGBoost ML score ───────────────────────────────────────────
+        features_df, ml_flag_cols = self._build_features(transaction, derived)
+        ml_probability = float(self.model.predict_proba(features_df)[0][1])
+        ml_score       = round(ml_probability * 100, 2)
+
+        ml_fired_flags = [
+            f for f in ml_flag_cols
+            if f in features_df.columns and features_df[f].iloc[0] == 1
+        ]
+
+        # ── Step 3: YAML rule engine score ────────────────────────────────────
+        # Build context for rule evaluation (all derived + transaction fields)
+        rule_ctx = {}
+        rule_ctx.update(cust)
+        rule_ctx.update(transaction)
+        rule_ctx.update(derived)
+
+        yaml_fired, yaml_raw, max_yaml, critical_fired = evaluate_yaml_rules(
+            self.rules, rule_ctx)
+        max_yaml = max_yaml if max_yaml > 0 else self.max_yaml_score
+
+        yaml_norm = round((yaml_raw / max_yaml * 100), 2) if max_yaml > 0 else 0
+
+        # ── Step 4: Composite score (60% ML + 40% YAML) ───────────────────────
+        composite = self._composite_score(ml_score, yaml_raw, max_yaml)
+
+        # ── Step 5: Final risk level with safety net ───────────────────────────
+        risk_level, alarm_reason = self._risk_level(
+            composite, yaml_raw, critical_fired)
 
         return {
+            # Core output
             "customer_id":    cid,
             "beneficiary_id": bid,
-            "ml_probability": round(probability, 4),
-            "ml_score":       ml_score,
-            "prediction":     "Suspected" if probability >= 0.5 else "Not Suspected",
+            "prediction":     "Suspected" if ml_probability >= 0.5 else "Not Suspected",
             "risk_level":     risk_level,
-            "fraud_signals":  fired,
-            "signal_count":   len(fired),
+            "alarm_reason":   alarm_reason,
+
+            # Score breakdown
+            "composite_score":     composite,
+            "ml_score":            ml_score,
+            "ml_probability":      round(ml_probability, 4),
+            "yaml_score_raw":      yaml_raw,
+            "yaml_score_normalised": yaml_norm,
+            "yaml_max_possible":   max_yaml,
+
+            # Weights applied
+            "weights": {"ml": 0.60, "yaml": 0.40},
+
+            # Signals
+            "ml_signals":     ml_fired_flags,
+            "yaml_rules_fired": [
+                f"{r['id']} {r['name']} (+{r['score']} pts, {r['severity']})"
+                for r in yaml_fired
+            ],
+            "signal_count":   len(ml_fired_flags),
+            "yaml_rule_count": len(yaml_fired),
+
+            # Transparency — what was auto-derived
             "auto_derived": {
-                "beneficiary_nationality": derived.get("beneficiary_nationality"),
-                "is_cross_nationality":    derived.get("is_cross_nationality"),
-                "is_new_device":           derived.get("is_new_device"),
-                "is_new_beneficiary":      derived.get("is_new_beneficiary"),
-                "is_high_risk_country":    derived.get("is_high_risk_country"),
-                "login_attempts_before":   derived.get("login_attempts_before"),
-                "transaction_hour":        derived.get("transaction_hour"),
-                "is_unusual_hour":         derived.get("is_unusual_hour"),
-                "customer_avg_amount":     derived.get("customer_avg_amount"),
-                "amount_vs_avg_ratio":     derived.get("amount_vs_avg_ratio"),
-                "device_mismatch":         derived.get("device_mismatch"),
-                "channel_mismatch":        derived.get("channel_mismatch"),
+                "beneficiary_nationality":  derived.get("beneficiary_nationality"),
+                "is_cross_nationality":     derived.get("is_cross_nationality"),
+                "is_new_device":            derived.get("is_new_device"),
+                "is_new_beneficiary":       derived.get("is_new_beneficiary"),
+                "is_high_risk_country":     derived.get("is_high_risk_country"),
+                "login_attempts_before":    derived.get("login_attempts_before"),
+                "transaction_hour":         derived.get("transaction_hour"),
+                "is_unusual_hour":          derived.get("is_unusual_hour"),
+                "customer_avg_amount":      derived.get("customer_avg_amount"),
+                "amount_vs_avg_ratio":      derived.get("amount_vs_avg_ratio"),
+                "beneficiary_age_days":     derived.get("beneficiary_age_days"),
+                "recent_login_new_location":derived.get("recent_login_new_location"),
+                "recent_mfa_used":          derived.get("recent_mfa_used"),
             },
         }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("=" * 65)
-    print("  FRAUD PREDICTOR — MINIMAL INPUT DEMO")
-    print("=" * 65)
+    print("=" * 70)
+    print("  FRAUD PREDICTOR — COMPOSITE SCORING DEMO")
+    print("  Formula: composite = 0.60 x ML_score + 0.40 x YAML_normalised")
+    print("=" * 70)
 
     predictor = FraudPredictor()
 
-    print("\n── Test 1: Suspicious (night, new device, large spike) ──")
-    r = predictor.score_transaction({
-        "customer_id":      "CUST1042",
-        "beneficiary_id":   "BENE5001",
-        "amount_usd":       4500.00,
-        "transaction_type": "Wire Transfer",
-        "channel":          "Web Browser",
-        "device_used":      "Windows PC",
-        "transaction_date": "2026-04-10 03:15:00",
-    })
-    print(f"  Prediction   : {r['prediction']}")
-    print(f"  Risk Level   : {r['risk_level']}  (score: {r['ml_score']})")
-    print(f"  Signals ({r['signal_count']})   : {r['fraud_signals']}")
-    print("  Auto-derived flags:")
-    for k, v in r["auto_derived"].items():
-        print(f"    {k:<32} = {v}")
+    def print_result(label, r):
+        print(f"\n{'─'*60}")
+        print(f"  {label}")
+        print(f"{'─'*60}")
+        print(f"  Prediction        : {r['prediction']}")
+        print(f"  Risk Level        : {r['risk_level']}  [{r['alarm_reason']}]")
+        print(f"  ─ Composite Score : {r['composite_score']:.1f} / 100")
+        print(f"  ─ ML Score        : {r['ml_score']:.1f}  (weight 60%)")
+        print(f"  ─ YAML Score      : {r['yaml_score_raw']} raw "
+              f"→ {r['yaml_score_normalised']:.1f} normalised  (weight 40%)")
+        print(f"  ML Signals  ({r['signal_count']})  : {r['ml_signals']}")
+        print(f"  YAML Rules  ({r['yaml_rule_count']})  :")
+        for rr in r["yaml_rules_fired"]:
+            print(f"      {rr}")
+        print(f"  Auto-derived flags:")
+        for k, v in r["auto_derived"].items():
+            print(f"      {k:<36} = {v}")
 
-    print("\n── Test 2: Normal (small amount, daytime, known device) ──")
-    r = predictor.score_transaction({
-        "customer_id":      "CUST1010",
-        "beneficiary_id":   "BENE5050",
-        "amount_usd":       150.00,
-        "transaction_type": "Bill Payment",
-        "channel":          "Mobile App",
-        "device_used":      "iPhone 14",
-        "transaction_date": "2026-04-10 14:30:00",
-    })
-    print(f"  Prediction   : {r['prediction']}")
-    print(f"  Risk Level   : {r['risk_level']}  (score: {r['ml_score']})")
-    print(f"  Signals ({r['signal_count']})   : {r['fraud_signals']}")
-    print("  Auto-derived flags:")
-    for k, v in r["auto_derived"].items():
-        print(f"    {k:<32} = {v}")
+    print_result("Test 1: Highly suspicious (night, new device, large spike, high-risk country)",
+        predictor.score_transaction({
+            "customer_id":      "CUST1042",
+            "beneficiary_id":   "BENE5001",
+            "amount_usd":       4500.00,
+            "transaction_type": "Wire Transfer",
+            "channel":          "Web Browser",
+            "device_used":      "Windows PC",
+            "transaction_date": "2026-04-10 03:15:00",
+        })
+    )
 
-    print("\n── Test 3: Moderate spike, no transaction_date (defaults to now) ──")
-    r = predictor.score_transaction({
-        "customer_id":      "CUST1075",
-        "beneficiary_id":   "BENE5200",
-        "amount_usd":       600.00,
-        "transaction_type": "Wire Transfer",
-        "channel":          "Mobile App",
-        "device_used":      "Samsung S23",
-    })
-    print(f"  Prediction   : {r['prediction']}")
-    print(f"  Risk Level   : {r['risk_level']}  (score: {r['ml_score']})")
-    print(f"  Signals ({r['signal_count']})   : {r['fraud_signals']}")
-    print("  Auto-derived flags:")
-    for k, v in r["auto_derived"].items():
-        print(f"    {k:<32} = {v}")
+    print_result("Test 2: Normal transaction",
+        predictor.score_transaction({
+            "customer_id":      "CUST1010",
+            "beneficiary_id":   "BENE5050",
+            "amount_usd":       150.00,
+            "transaction_type": "Bill Payment",
+            "channel":          "Mobile App",
+            "device_used":      "iPhone 14",
+            "transaction_date": "2026-04-10 14:30:00",
+        })
+    )
 
-    print("\n" + "=" * 65)
+    print_result("Test 3: NEW CUSTOMER — recent registration + cross-nationality",
+        predictor.score_transaction({
+            "customer_id":      "CUST1084",  # 8 days old account!
+            "beneficiary_id":   "BENE5200",
+            "amount_usd":       600.00,
+            "transaction_type": "Wire Transfer",
+            "channel":          "Mobile App",
+            "device_used":      "Samsung S23",
+        })
+    )
+
+    print(f"\n{'='*70}")
     print("  DEMO COMPLETE")
-    print("=" * 65)
+    print(f"{'='*70}")

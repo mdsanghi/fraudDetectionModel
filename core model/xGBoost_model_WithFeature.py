@@ -2,9 +2,8 @@
 Fraud Detection System — XGBoost Pipeline
 ==========================================
 Complete ML pipeline: Data loading → EDA → Feature engineering →
-PCA analysis → Stratified split → Hyperparameter tuning →
-Training → Evaluation (F1, Precision, Recall, Accuracy, ROC-AUC,
-PR-AUC) → Charts & graphs.
+Stratified split → Hyperparameter tuning → Training → Evaluation
+(F1, Precision, Recall, Accuracy, ROC-AUC, PR-AUC) → Charts & graphs.
 
 Usage (from project root):
     python "core model/xGBoost_model.py"
@@ -24,7 +23,6 @@ from sklearn.model_selection import (
     RandomizedSearchCV
 )
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.decomposition import PCA
 from sklearn.metrics import (
     classification_report, confusion_matrix, roc_auc_score,
     roc_curve, precision_recall_curve, average_precision_score,
@@ -476,89 +474,17 @@ def preprocess(df):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. PCA ANALYSIS
+# 5. STRATIFIED SPLIT
 # ═══════════════════════════════════════════════════════════════════
-def run_pca_analysis(X, y, charts_dir):
+def stratified_split(X, y):
     print("\n" + "=" * 70)
-    print("  STEP 5: PCA ANALYSIS")
+    print("  STEP 5: STRATIFIED TRAIN/TEST SPLIT (80/20)")
     print("=" * 70)
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Full PCA to analyze variance
-    pca_full = PCA()
-    pca_full.fit(X_scaled)
-
-    cumulative_var = np.cumsum(pca_full.explained_variance_ratio_)
-    n_95 = np.argmax(cumulative_var >= 0.95) + 1
-    n_99 = np.argmax(cumulative_var >= 0.99) + 1
-
-    print(f"  Total components      : {len(cumulative_var)}")
-    print(f"  Components for 95% var: {n_95}")
-    print(f"  Components for 99% var: {n_99}")
-    print(f"  Top 5 explained variance: {np.round(pca_full.explained_variance_ratio_[:5], 4)}")
-
-    # PCA charts
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    fig.suptitle("PCA Analysis", fontsize=16, fontweight="bold")
-
-    # Chart 1: Explained variance per component
-    n_show = min(20, len(pca_full.explained_variance_ratio_))
-    axes[0].bar(range(1, n_show + 1), pca_full.explained_variance_ratio_[:n_show],
-                color="#1f77b4", edgecolor="white", alpha=0.8)
-    axes[0].set_title("Explained variance per component")
-    axes[0].set_xlabel("Principal component")
-    axes[0].set_ylabel("Explained variance ratio")
-
-    # Chart 2: Cumulative variance
-    axes[1].plot(range(1, len(cumulative_var) + 1), cumulative_var, "b-o", markersize=4)
-    axes[1].axhline(y=0.95, color="red", linestyle="--", label="95% threshold")
-    axes[1].axhline(y=0.99, color="orange", linestyle="--", label="99% threshold")
-    axes[1].axvline(x=n_95, color="red", linestyle=":", alpha=0.5)
-    axes[1].axvline(x=n_99, color="orange", linestyle=":", alpha=0.5)
-    axes[1].set_title("Cumulative explained variance")
-    axes[1].set_xlabel("Number of components")
-    axes[1].set_ylabel("Cumulative variance")
-    axes[1].legend()
-
-    # Chart 3: 2D PCA scatter
-    pca_2d = PCA(n_components=2)
-    X_2d = pca_2d.fit_transform(X_scaled)
-    scatter_colors = np.where(y == 1, "#d62728", "#2ca02c")
-    axes[2].scatter(X_2d[y == 0, 0], X_2d[y == 0, 1], c="#2ca02c", alpha=0.3, s=10, label="Legit")
-    axes[2].scatter(X_2d[y == 1, 0], X_2d[y == 1, 1], c="#d62728", alpha=0.8, s=30, label="Fraud", marker="x")
-    axes[2].set_title("2D PCA projection")
-    axes[2].set_xlabel(f"PC1 ({pca_2d.explained_variance_ratio_[0]:.1%})")
-    axes[2].set_ylabel(f"PC2 ({pca_2d.explained_variance_ratio_[1]:.1%})")
-    axes[2].legend()
-
-    plt.tight_layout()
-    pca_path = os.path.join(charts_dir, "03_pca_analysis.png")
-    fig.savefig(pca_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  ✓ PCA charts saved → {pca_path}")
-
-    # Return PCA-transformed data alongside originals for comparison
-    pca_optimal = PCA(n_components=n_95)
-    X_pca = pd.DataFrame(
-        pca_optimal.fit_transform(X_scaled),
-        columns=[f"PC{i+1}" for i in range(n_95)]
-    )
-    print(f"  PCA reduced: {X.shape[1]} features → {n_95} components (95% variance)")
-
-    return X_pca, scaler, pca_optimal, n_95
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 6. STRATIFIED SPLIT
-# ═══════════════════════════════════════════════════════════════════
-def stratified_split(X, y, X_pca):
     print("\n" + "=" * 70)
     print("  STEP 6: STRATIFIED TRAIN/TEST SPLIT (80/20)")
     print("=" * 70)
 
-    # Use index-based splitting so PCA stays aligned
+    # Use index-based splitting
     indices = np.arange(len(y))
     idx_trainval, idx_test = train_test_split(
         indices, test_size=0.20, stratify=y, random_state=42
@@ -569,16 +495,13 @@ def stratified_split(X, y, X_pca):
 
     X_train, X_val, X_test = X.iloc[idx_train], X.iloc[idx_val], X.iloc[idx_test]
     y_train, y_val, y_test = y.iloc[idx_train], y.iloc[idx_val], y.iloc[idx_test]
-    y_trainval = y.iloc[idx_trainval]  # for PCA model
-    X_train_pca = X_pca.iloc[idx_trainval]  # PCA train+val (for comparison model)
-    X_test_pca = X_pca.iloc[idx_test]
 
     print(f"  Train : {X_train.shape[0]:>5,} samples ({y_train.mean():.2%} fraud)")
     print(f"  Val   : {X_val.shape[0]:>5,} samples ({y_val.mean():.2%} fraud)")
     print(f"  Test  : {X_test.shape[0]:>5,} samples ({y_test.mean():.2%} fraud)")
     print(f"  ✓ Stratification preserved across all splits")
 
-    return X_train, X_val, X_test, y_train, y_val, y_test, X_train_pca, X_test_pca, y_trainval
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -607,7 +530,6 @@ def tune_hyperparameters(X_train, y_train):
     base_model = xgb.XGBClassifier(
         eval_metric="aucpr",
         random_state=42,
-        use_label_encoder=False,
         tree_method="hist",
     )
 
@@ -650,7 +572,6 @@ def train_model(X_train, y_train, X_val, y_val, best_params):
         eval_metric="aucpr",
         early_stopping_rounds=30,
         random_state=42,
-        use_label_encoder=False,
         tree_method="hist",
     )
 
@@ -766,79 +687,17 @@ def plot_evaluation_dashboard(y_test, y_pred, y_proba, metrics, feature_names,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 10. PCA vs ORIGINAL COMPARISON
-# ═══════════════════════════════════════════════════════════════════
-def train_and_compare_pca(X_train_pca, X_test_pca, y_train, y_test,
-                           best_params, metrics_original, charts_dir):
-    print("\n" + "=" * 70)
-    print("  STEP 10: PCA MODEL — TRAIN & COMPARE")
-    print("=" * 70)
-
-    # Need a fresh train/val split for PCA data
-    X_tr, X_vl, y_tr, y_vl = train_test_split(
-        X_train_pca, y_train, test_size=0.15, stratify=y_train, random_state=42
-    )
-
-    pca_model = xgb.XGBClassifier(
-        **best_params,
-        eval_metric="aucpr",
-        early_stopping_rounds=30,
-        random_state=42,
-        use_label_encoder=False,
-        tree_method="hist",
-    )
-    pca_model.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=0)
-
-    metrics_pca, y_pred_pca, y_proba_pca = evaluate_model(
-        pca_model, X_test_pca, y_test,
-        list(X_test_pca.columns), charts_dir, label="PCA"
-    )
-
-    # Comparison chart
-    fig, ax = plt.subplots(figsize=(10, 6))
-    metric_names = list(metrics_original.keys())
-    x_pos = np.arange(len(metric_names))
-    w = 0.35
-
-    vals_orig = [metrics_original[m] for m in metric_names]
-    vals_pca = [metrics_pca[m] for m in metric_names]
-
-    bars1 = ax.bar(x_pos - w / 2, vals_orig, w, label="Original features", color="#1f77b4", edgecolor="white")
-    bars2 = ax.bar(x_pos + w / 2, vals_pca, w, label="PCA features", color="#ff7f0e", edgecolor="white")
-
-    ax.set_ylim(0, 1.1)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(metric_names, rotation=30, ha="right")
-    ax.set_title("Original features vs PCA — metric comparison", fontsize=14, fontweight="bold")
-    ax.legend()
-
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                    f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    plt.tight_layout()
-    comp_path = os.path.join(charts_dir, "05_pca_comparison.png")
-    fig.savefig(comp_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  ✓ Comparison chart saved → {comp_path}")
-
-    return metrics_pca, pca_model
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 11. CROSS VALIDATION
+# 9. CROSS VALIDATION
 # ═══════════════════════════════════════════════════════════════════
 def cross_validate_final(best_params, X, y, charts_dir):
     print("\n" + "=" * 70)
-    print("  STEP 11: 5-FOLD CROSS VALIDATION")
+    print("  STEP 9: 5-FOLD CROSS VALIDATION")
     print("=" * 70)
 
     cv_model = xgb.XGBClassifier(
         **best_params,
         eval_metric="aucpr",
         random_state=42,
-        use_label_encoder=False,
         tree_method="hist",
     )
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -874,10 +733,10 @@ def cross_validate_final(best_params, X, y, charts_dir):
 # ═══════════════════════════════════════════════════════════════════
 # 12. SAVE ARTIFACTS
 # ═══════════════════════════════════════════════════════════════════
-def save_artifacts(model, X, best_params, metrics_orig, metrics_pca,
+def save_artifacts(model, X, best_params, metrics_orig,
                     cv_results, label_encoders, le_target, output_dir):
     print("\n" + "=" * 70)
-    print("  STEP 12: SAVING MODEL & ARTIFACTS")
+    print("  STEP 10: SAVING MODEL & ARTIFACTS")
     print("=" * 70)
 
     # Save model
@@ -896,8 +755,7 @@ def save_artifacts(model, X, best_params, metrics_orig, metrics_pca,
         "target": TARGET_COL,
         "best_hyperparameters": {k: (v if not isinstance(v, np.integer) else int(v))
                                   for k, v in best_params.items()},
-        "metrics_original_features": metrics_orig,
-        "metrics_pca_features": metrics_pca,
+        "metrics": metrics_orig,
         "cross_validation": {k: {"mean": v["mean"], "std": v["std"]}
                               for k, v in cv_results.items()},
         "label_encoders": {col: list(le.classes_) for col, le in label_encoders.items()},
@@ -933,51 +791,40 @@ def main():
     # 4. Preprocess
     X, y, label_encoders, le_target = preprocess(df)
 
-    # 5. PCA
-    X_pca, scaler, pca_model_obj, n_pca = run_pca_analysis(X, y, CHARTS_DIR)
-
-    # 6. Stratified split
+    # 5. Stratified split
     (X_train, X_val, X_test,
-     y_train, y_val, y_test,
-     X_train_pca, X_test_pca, y_trainval) = stratified_split(X, y, X_pca)
+     y_train, y_val, y_test) = stratified_split(X, y)
 
-    # 7. Hyperparameter tuning
+    # 6. Hyperparameter tuning
     best_params, search = tune_hyperparameters(X_train, y_train)
 
-    # 8. Train final model
+    # 7. Train final model
     model = train_model(X_train, y_train, X_val, y_val, best_params)
 
-    # 9. Evaluate (original features)
+    # 8. Evaluate
     metrics_orig, y_pred, y_proba = evaluate_model(
         model, X_test, y_test, list(X.columns), CHARTS_DIR, label="Original"
     )
     plot_evaluation_dashboard(y_test, y_pred, y_proba, metrics_orig,
                                list(X.columns), model, CHARTS_DIR)
 
-    # 10. PCA comparison
-    metrics_pca, pca_trained = train_and_compare_pca(
-        X_train_pca, X_test_pca, y_trainval, y_test, best_params, metrics_orig, CHARTS_DIR
-    )
-
-    # 11. Cross-validation
+    # 9. Cross-validation
     cv_results = cross_validate_final(best_params, X, y, CHARTS_DIR)
 
-    # 12. Save
-    save_artifacts(model, X, best_params, metrics_orig, metrics_pca,
+    # 10. Save
+    save_artifacts(model, X, best_params, metrics_orig,
                    cv_results, label_encoders, le_target, OUTPUT_DIR)
 
     # Final summary
     print("\n" + "█" * 70)
     print("  PIPELINE COMPLETE — SUMMARY")
     print("█" * 70)
-    print(f"\n  {'Metric':<20} {'Original':>10} {'PCA':>10}")
-    print(f"  {'─' * 42}")
+    print(f"\n  {'Metric':<20} {'Value':>10}")
+    print(f"  {'─' * 32}")
     for k in metrics_orig:
-        print(f"  {k:<20} {metrics_orig[k]:>10.4f} {metrics_pca[k]:>10.4f}")
+        print(f"  {k:<20} {metrics_orig[k]:>10.4f}")
     print(f"\n  Charts saved to: {CHARTS_DIR}")
     print(f"  Model saved to : {OUTPUT_DIR}")
-    recommendation = "Original" if metrics_orig["f1_score"] >= metrics_pca["f1_score"] else "PCA"
-    print(f"\n  ★ Recommended model: {recommendation} features (higher F1)")
     print("█" * 70)
 
 

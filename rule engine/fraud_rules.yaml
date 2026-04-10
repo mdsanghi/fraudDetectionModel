@@ -1,0 +1,191 @@
+version: 1.0
+name: fraud_detection_rule_engine
+risk_levels:
+  low_max_score: 29
+  medium_max_score: 69
+  high_min_score: 70
+
+defaults:
+  enabled: true
+  action: add_score
+  severity: medium
+
+notes:
+  - Rules are based on fields present in Customers, Beneficiaries, Transactions, and Login_History.
+  - Some rules need joined or engineered features before evaluation.
+  - The when clause is Python-like so you can evaluate it dynamically from YAML.
+
+rules:
+  - id: R01
+    name: amount_spike_2x
+    description: Transaction amount is at least 2x the customer's average amount.
+    severity: medium
+    score: 15
+    when: amount_vs_avg_ratio >= 2.0
+    source_sheet: Transactions
+
+  - id: R02
+    name: amount_spike_3x
+    description: Transaction amount is at least 3x the customer's average amount.
+    severity: high
+    score: 25
+    when: amount_vs_avg_ratio >= 3.0
+    source_sheet: Transactions
+
+  - id: R03
+    name: extreme_amount_spike_5x
+    description: Transaction amount is at least 5x the customer's average amount.
+    severity: critical
+    score: 40
+    when: amount_vs_avg_ratio >= 5.0
+    source_sheet: Transactions
+
+  - id: R04
+    name: new_device_used
+    description: Transaction is initiated from a device not previously seen for this customer.
+    severity: high
+    score: 22
+    when: is_new_device == true
+    source_sheet: Transactions
+
+  - id: R05
+    name: new_beneficiary_used
+    description: Customer is sending to a beneficiary for the first time.
+    severity: medium
+    score: 10
+    when: is_new_beneficiary == true
+    source_sheet: Transactions
+
+  - id: R06
+    name: new_beneficiary_cross_nationality
+    description: First-time beneficiary whose nationality differs from the customer's nationality.
+    severity: high
+    score: 18
+    when: is_new_beneficiary == true and is_cross_nationality == true
+    source_sheet: Transactions
+
+  - id: R07
+    name: high_risk_country
+    description: Beneficiary is mapped to a high-risk country.
+    severity: high
+    score: 20
+    when: is_high_risk_country == true
+    source_sheet: Transactions
+
+  - id: R08
+    name: new_beneficiary_high_risk_country
+    description: First-time beneficiary belongs to a high-risk country.
+    severity: critical
+    score: 30
+    when: is_new_beneficiary == true and is_high_risk_country == true
+    source_sheet: Transactions
+
+  - id: R09
+    name: unusual_hour_transaction
+    description: Transaction is made during an unusual hour.
+    severity: medium
+    score: 12
+    when: is_unusual_hour == true
+    source_sheet: Transactions
+
+  - id: R10
+    name: deep_night_transaction
+    description: Transaction is made between 1 AM and 4 AM.
+    severity: high
+    score: 18
+    when: transaction_hour >= 1 and transaction_hour <= 4
+    source_sheet: Transactions
+
+  - id: R11
+    name: repeated_login_attempts
+    description: There were multiple login attempts before the transaction.
+    severity: medium
+    score: 10
+    when: login_attempts_before >= 3
+    source_sheet: Transactions
+
+  - id: R12
+    name: high_login_attempts_with_new_device
+    description: Multiple login attempts combined with a new device.
+    severity: high
+    score: 20
+    when: login_attempts_before >= 3 and is_new_device == true
+    source_sheet: Transactions
+
+  - id: R13
+    name: cross_nationality_large_transfer
+    description: Cross-nationality transfer with materially elevated amount.
+    severity: high
+    score: 18
+    when: is_cross_nationality == true and amount_vs_avg_ratio >= 1.5
+    source_sheet: Transactions
+
+  - id: R14
+    name: customer_high_risk_tier_large_amount
+    description: Customer already belongs to High risk tier and sends a large transfer.
+    severity: high
+    score: 18
+    when: customer_risk_tier == 'High' and amount_vs_avg_ratio >= 1.5
+    source_sheet: Transactions+Customers
+    required_features:
+      - customer_risk_tier
+
+  - id: R15
+    name: incomplete_kyc_with_transfer
+    description: Transfer initiated by a customer whose KYC is not Verified.
+    severity: high
+    score: 22
+    when: customer_kyc_status != 'Verified'
+    source_sheet: Transactions+Customers
+    required_features:
+      - customer_kyc_status
+
+  - id: R16
+    name: dormant_or_restricted_account_activity
+    description: Transfer initiated from an account whose status is not Active.
+    severity: critical
+    score: 35
+    when: customer_account_status != 'Active'
+    source_sheet: Transactions+Customers
+    required_features:
+      - customer_account_status
+
+  - id: R17
+    name: beneficiary_not_verified_large_transfer
+    description: Large transfer to a beneficiary that is not verified.
+    severity: high
+    score: 18
+    when: beneficiary_is_verified == false and amount_vs_avg_ratio >= 1.5
+    source_sheet: Transactions+Beneficiaries
+    required_features:
+      - beneficiary_is_verified
+
+  - id: R18
+    name: recent_new_beneficiary_quick_transfer
+    description: Transfer to a beneficiary added very recently.
+    severity: high
+    score: 20
+    when: beneficiary_age_days <= 3
+    source_sheet: Transactions+Beneficiaries
+    required_features:
+      - beneficiary_age_days
+
+  - id: R19
+    name: location_shift_before_transaction
+    description: Latest login before transaction was from a new location or country.
+    severity: high
+    score: 20
+    when: recent_login_new_location == true
+    source_sheet: Transactions+Login_History
+    required_features:
+      - recent_login_new_location
+
+  - id: R20
+    name: no_mfa_high_value_transfer
+    description: High-value transfer initiated on a recent session without MFA.
+    severity: critical
+    score: 28
+    when: recent_mfa_used == false and amount_vs_avg_ratio >= 2.0
+    source_sheet: Transactions+Login_History
+    required_features:
+      - recent_mfa_used

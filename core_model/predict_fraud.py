@@ -736,9 +736,9 @@ if __name__ == "__main__":
 
     print_result("Test 3: NEW CUSTOMER — recent registration + cross-nationality",
         predictor.score_transaction({
-            "customer_id":      "CUST1084",  # 8 days old account!
-            "beneficiary_id":   "BENE5200",
-            "amount_usd":       600.00,
+            "customer_id":      "CUST1000",  # 8 days old account!
+            "beneficiary_id":   "BENE5001",
+            "amount_usd":       3263.00,
             "transaction_type": "Wire Transfer",
             "channel":          "Mobile App",
             "device_used":      "Samsung S23",

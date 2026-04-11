@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
-
+from integration_layer.fraud_bridge import run_fraud_check
 st.set_page_config(page_title="NBO Transfer", layout="centered", initial_sidebar_state="collapsed")
 
 # ── Session State ──────────────────────────────────────────────────────────────
@@ -790,7 +790,12 @@ elif st.session_state.screen == "otp":
     with c2:
         st.markdown('<div style="display:flex;align-items:stretch;">', unsafe_allow_html=True)
         if st.button("Submit OTP", key="otp_submit"):
+            # OLD (remove this):
             st.session_state.risk_result = compute_risk(st.session_state.transfer_data)
+
+            # NEW (replace with this):
+            with st.spinner("Verifying transaction..."):
+                st.session_state.risk_result = run_fraud_check(st.session_state.transfer_data)
             go("result")
         st.markdown('</div>', unsafe_allow_html=True)
 

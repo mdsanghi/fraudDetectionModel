@@ -793,9 +793,9 @@ elif st.session_state.screen == "otp":
             # OLD (remove this):
             st.session_state.risk_result = compute_risk(st.session_state.transfer_data)
 
-            # NEW (replace with this):
-            with st.spinner("Verifying transaction..."):
-                st.session_state.risk_result = run_fraud_check(st.session_state.transfer_data)
+            # # NEW (replace with this):
+            # with st.spinner("Verifying transaction..."):
+            #     st.session_state.risk_result = run_fraud_check(st.session_state.transfer_data)
             go("result")
         st.markdown('</div>', unsafe_allow_html=True)
 

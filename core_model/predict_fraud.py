@@ -194,6 +194,8 @@ class FraudPredictor:
                  rules_path: str = None):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cwd        = os.getcwd()
+        print("\n[predict_fraud] Initializing FraudPredictor")
+        print(f"[predict_fraud] cwd={cwd}")
 
         # ── Resolve model dir ──────────────────────────────────────────────────
         search_model = [d for d in [model_dir, script_dir, cwd,
@@ -205,6 +207,7 @@ class FraudPredictor:
         if not resolved_model_dir:
             raise FileNotFoundError(
                 f"xgb_fraud_model.json not found. Searched: {search_model}")
+        print(f"[predict_fraud] resolved_model_dir={resolved_model_dir}")
 
         # ── Resolve data path ──────────────────────────────────────────────────
         search_data = [d for d in [data_path, cwd, script_dir,
@@ -218,6 +221,7 @@ class FraudPredictor:
         if not resolved_data:
             raise FileNotFoundError(
                 "fraud_detection_synthetic_data.xlsx not found. Pass data_path=")
+        print(f"[predict_fraud] resolved_data={resolved_data}")
 
         # ── Resolve YAML rules path ────────────────────────────────────────────
         search_rules = [rules_path] if rules_path else []
@@ -230,6 +234,7 @@ class FraudPredictor:
              for d in search_rules
              if d and os.path.exists(os.path.join(d, "fraud_rules.yaml"))),
             None)
+        print(f"[predict_fraud] resolved_rules={resolved_rules}")
 
         # ── Load XGBoost model ─────────────────────────────────────────────────
         self.model = xgb.XGBClassifier()
@@ -602,12 +607,16 @@ class FraudPredictor:
         bid  = transaction.get("beneficiary_id", "")
         cust = self._cust_map.get(cid, {})
         bene = self._bene_map.get(bid, {})
+        print(f"\n[predict_fraud] score_transaction called for customer_id={cid}, beneficiary_id={bid}")
+        print(f"[predict_fraud] incoming transaction={transaction}")
 
         # ── Step 1: Derive all flags automatically ─────────────────────────────
         derived = self._derive_flags(transaction, cust, bene)
+        print(f"[predict_fraud] derived flags={derived}")
 
         # ── Step 2: XGBoost ML score ───────────────────────────────────────────
         features_df, ml_flag_cols = self._build_features(transaction, derived)
+        print(f"[predict_fraud] feature shape={features_df.shape}")
         ml_probability = float(self.model.predict_proba(features_df)[0][1])
         ml_score       = round(ml_probability * 100, 2)
 
@@ -628,6 +637,12 @@ class FraudPredictor:
         max_yaml = max_yaml if max_yaml > 0 else self.max_yaml_score
 
         yaml_norm = round((yaml_raw / max_yaml * 100), 2) if max_yaml > 0 else 0
+        print(
+            "[predict_fraud] scoring summary: "
+            f"ml_probability={ml_probability:.4f}, ml_score={ml_score}, "
+            f"yaml_raw={yaml_raw}, yaml_norm={yaml_norm}, "
+            f"critical_fired={critical_fired}, ml_flags={ml_fired_flags}"
+        )
 
         # ── Step 4: Composite score (60% ML + 40% YAML) ───────────────────────
         composite = self._composite_score(ml_score, yaml_raw, max_yaml)
@@ -635,6 +650,10 @@ class FraudPredictor:
         # ── Step 5: Final risk level with safety net ───────────────────────────
         risk_level, alarm_reason = self._risk_level(
             composite, yaml_raw, critical_fired)
+        print(
+            "[predict_fraud] final decision: "
+            f"composite={composite}, risk_level={risk_level}, alarm_reason={alarm_reason}"
+        )
 
         return {
             # Core output

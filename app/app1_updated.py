@@ -919,6 +919,7 @@ elif st.session_state.screen == "otp":
         st.markdown('<div style="display:flex;align-items:stretch;">', unsafe_allow_html=True)
         if st.button("Submit OTP", key="otp_submit"):
             with st.spinner("Verifying transaction..."):
+                print("[app1_updated] run_fraud_check available:", run_fraud_check is not None)
                 if run_fraud_check is not None:
                     print("[app1_updated] TRANSFER DATA:", st.session_state.transfer_data)
                     st.session_state.risk_result = run_fraud_check(st.session_state.transfer_data)

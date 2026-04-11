@@ -19,13 +19,12 @@ HOW TO WIRE INTO app1.py
 
 ACTION MATRIX:
     Low    → no action
-    Medium → send fraud alert email to compliance team (async, non-blocking)
-    High   → send escalated fraud alert email to compliance team (async, non-blocking)
+    Medium → send fraud alert email to compliance team
+    High   → send escalated fraud alert email to compliance team
 """
 
 import os
 import sys
-import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -287,8 +286,8 @@ def _fallback_risk(td: dict) -> dict:
     }
 
 
-def _send_async(result: dict, td: dict, level: str):
-    """Send alert email in background thread."""
+def _send_alert_email(result: dict, td: dict, level: str) -> bool:
+    """Send alert email synchronously and return success state."""
     try:
         recipient_email = (
             td.get("customer_email")
@@ -322,9 +321,11 @@ def _send_async(result: dict, td: dict, level: str):
             )
 
         print(f"  [fraud_bridge] Email sent → {recipient_email}  [{level}]")
+        return True
     except Exception as e:
         print(f"  [fraud_bridge] Email failed: {e}")
         traceback.print_exc()
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -342,8 +343,8 @@ def run_fraud_check(transfer_data: dict) -> dict:
         dict with keys: level, score, triggered  (+ extended scoring fields)
 
     Side effects:
-        Medium risk → sends fraud alert email (async)
-        High risk   → sends escalated fraud alert email (async)
+        Medium risk → sends fraud alert email
+        High risk   → sends escalated fraud alert email
         Low risk    → no email
     """
     print(f"\n[fraud_bridge] Checking: "
@@ -375,16 +376,9 @@ def run_fraud_check(transfer_data: dict) -> dict:
     print(f"  [fraud_bridge] Result: {level} | Score: {result.get('score')} | "
           f"Alarm: {result.get('alarm_reason', '-')}")
 
-    # Dispatch email for Medium and High
+    # Send email for Medium and High
     if level in ("Medium", "High"):
-        t = threading.Thread(
-            target=_send_async,
-            args=(result, enriched_transfer_data, level),
-            daemon=False,
-        )
-        t.start()
-        result["email_sent"] = True
-        print(f"  [fraud_bridge] Alert email queued → {COMPLIANCE_EMAIL}")
+        result["email_sent"] = _send_alert_email(result, enriched_transfer_data, level)
     else:
         result["email_sent"] = False
         print(f"  [fraud_bridge] Low risk — no email")
@@ -401,7 +395,7 @@ if __name__ == "__main__":
     sample_transfer = {
         "customer_id":         "CUST1000",
         "beneficiary_id":      "BENE5001",
-        "amount_usd":          363.82,
+        "amount_usd":          364443.82,
         "channel":             "Mobile App",
         "device_used":         "MacBook Pro",
         "purpose":             "Family maintenance",

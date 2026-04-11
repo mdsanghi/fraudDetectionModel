@@ -110,13 +110,14 @@ def _map_transfer_to_txn(td: dict) -> dict:
     Assumptions:
         amount_usd is already provided by app1.py
         transfer_type              → "Wire Transfer" (mapped)
-        channel                    → "Mobile App"   (app is mobile)
-        device_used                → "iPhone 14"    (demo default)
+        channel and device_used are taken from the input when provided
     """
     customer_id = str(td.get("customer_id", DEFAULT_CUSTOMER_ID)).strip() or DEFAULT_CUSTOMER_ID
     beneficiary_id = str(td.get("beneficiary_id", DEFAULT_BENEFICIARY_ID)).strip() or DEFAULT_BENEFICIARY_ID
 
     amount_usd = round(float(td.get("amount_usd", 0)), 2)
+    channel = str(td.get("channel", "Mobile App"))
+    device_used = str(td.get("device_used", "iPhone 14"))
 
     transfer_type = td.get("transfer_type", "Transfer Immediately")
     txn_type = "Wire Transfer" if "transfer" in transfer_type.lower() else "Bill Payment"
@@ -126,18 +127,41 @@ def _map_transfer_to_txn(td: dict) -> dict:
         "beneficiary_id":   beneficiary_id,
         "amount_usd":       amount_usd,
         "transaction_type": txn_type,
-        "channel":          "Mobile App",
-        "device_used":      "iPhone 14",
-        "transaction_date": td.get("transfer_date", str(datetime.now().date())),
+        "channel":          channel,
+        "device_used":      device_used,
+        "transaction_date": td.get("transaction_timestamp", datetime.now().isoformat()),
     }
 
 
 def _enrich_transfer_data(transfer_data: dict, predictor: FraudPredictor | None = None) -> dict:
-    """Populate beneficiary details from Excel-backed predictor data using beneficiary_id."""
+    """Populate customer and beneficiary details from Excel-backed predictor data."""
     td = dict(transfer_data)
+    customer_id = str(td.get("customer_id", "")).strip()
     beneficiary_id = str(td.get("beneficiary_id", "")).strip()
 
-    if predictor is None or not beneficiary_id:
+    if predictor is None:
+        return td
+
+    if customer_id:
+        customer = predictor._cust_map.get(customer_id, {})
+        if customer:
+            td.setdefault("customer_name", str(customer.get("full_name", "")))
+            td.setdefault("customer_email", str(customer.get("email", "")))
+            td.setdefault("email", str(customer.get("email", "")))
+            td.setdefault("country_of_residence", str(customer.get("country_of_residence", "")))
+            td.setdefault("risk_tier", str(customer.get("risk_tier", "")))
+            td.setdefault("kyc_status", str(customer.get("kyc_status", "")))
+            td.setdefault("account_status", str(customer.get("account_status", "")))
+            td.setdefault(
+                "from_account_name",
+                f"{str(customer.get('preferred_channel', 'Mobile App')).upper()} ACCOUNT",
+            )
+
+            if not td.get("from_account"):
+                digits = "".join(ch for ch in customer_id if ch.isdigit())
+                td["from_account"] = (digits + "10470376449016")[:14]
+
+    if not beneficiary_id:
         return td
 
     beneficiary = predictor._bene_map.get(beneficiary_id, {})
@@ -376,13 +400,10 @@ if __name__ == "__main__":
 
     sample_transfer = {
         "customer_id":         "CUST1000",
-        "customer_name":       "Candace Perez",
-        "customer_email":      "msanghi.cdac@gmail.com",
-        "from_account":        "10470376441000",
-        "from_account_name":   "MOBILE APP ACCOUNT",
-        "available_balance":   18317.336,
         "beneficiary_id":      "BENE5001",
-        "amount_usd":          3263.82,
+        "amount_usd":          363.82,
+        "channel":             "Mobile App",
+        "device_used":         "MacBook Pro",
         "purpose":             "Family maintenance",
         "remark":              "",
         "transfer_type":       "Transfer Immediately",

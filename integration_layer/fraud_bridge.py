@@ -36,7 +36,7 @@ CORE_MODEL_DIR = PROJECT_ROOT / "core model"
 if str(CORE_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_MODEL_DIR))
 
-from email_config.gmail_sender import send_email, send_fraud_alert
+from communication.gmail_sender import send_email, send_fraud_alert
 from core_model.predict_fraud import FraudPredictor
 
 # ── Configuration ──────────────────────────────────────────────────────────────

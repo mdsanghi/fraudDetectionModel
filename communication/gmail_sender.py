@@ -13,10 +13,10 @@ Configuration:
     APP_PASSWORD = "your_16_char_app_password"
 
 Run examples:
-    python gmail_sender.py
+    python communication/gmail_sender.py
 
 Or import into your project:
-    from gmail_sender import send_email
+    from communication.gmail_sender import send_email
 """
 
 import os

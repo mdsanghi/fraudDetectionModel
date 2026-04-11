@@ -1,12 +1,19 @@
 import streamlit as st
 import pandas as pd
-from datetime import date
+import sys
+from datetime import date, datetime
 from pathlib import Path
+
+# Ensure the repository root is on sys.path so integration_layer imports work
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 # Optional fraud integration
 try:
     from integration_layer.fraud_bridge import run_fraud_check
-except Exception:
+except Exception as e:
+    print(f"[app1_updated] fraud_bridge import failed: {e}")
     run_fraud_check = None
 
 st.set_page_config(page_title="NBO Transfer", layout="centered", initial_sidebar_state="collapsed")
@@ -58,14 +65,16 @@ def estimate_balance_omr(customer_row: pd.Series, transactions_df: pd.DataFrame)
 
 def build_transfer_data(customer_row: pd.Series, beneficiary_row: pd.Series | None, transactions_df: pd.DataFrame):
     customer_name = str(customer_row.get("full_name", "Customer")).upper()
-    preferred_channel = str(customer_row.get("preferred_channel", "Mobile App")).upper()
+    preferred_channel = str(customer_row.get("preferred_channel", "Mobile App"))
     country = str(customer_row.get("country_of_residence", "Oman"))
     typical_txn = float(customer_row.get("typical_txn_amount", 15000) or 15000)
+    primary_device = str(customer_row.get("primary_device", "iPhone 14"))
 
     account_number = make_account_number(customer_row.get("customer_id", "10470376449016"))
     balance = estimate_balance_omr(customer_row, transactions_df)
 
     if beneficiary_row is not None:
+        beneficiary_id = str(beneficiary_row.get("beneficiary_id", ""))
         beneficiary_name = str(beneficiary_row.get("beneficiary_name", ""))
         beneficiary_account = str(beneficiary_row.get("account_number", ""))
         beneficiary_country = str(beneficiary_row.get("country", ""))
@@ -73,6 +82,7 @@ def build_transfer_data(customer_row: pd.Series, beneficiary_row: pd.Series | No
         beneficiary_branch = str(beneficiary_row.get("country", ""))
         beneficiary_town = str(beneficiary_row.get("country", ""))
     else:
+        beneficiary_id = ""
         beneficiary_name = ""
         beneficiary_account = ""
         beneficiary_country = ""
@@ -84,8 +94,9 @@ def build_transfer_data(customer_row: pd.Series, beneficiary_row: pd.Series | No
         "customer_id": str(customer_row.get("customer_id", "")),
         "customer_name": customer_name,
         "from_account": account_number,
-        "from_account_name": f"{preferred_channel} ACCOUNT",
+        "from_account_name": f"{preferred_channel.upper()} ACCOUNT",
         "available_balance": balance,
+        "beneficiary_id": beneficiary_id,
         "beneficiary_name": beneficiary_name,
         "beneficiary_account": beneficiary_account,
         "beneficiary_country": beneficiary_country,
@@ -93,16 +104,19 @@ def build_transfer_data(customer_row: pd.Series, beneficiary_row: pd.Series | No
         "beneficiary_branch": beneficiary_branch,
         "beneficiary_town": beneficiary_town,
         "exchange_rate": 239.58 if beneficiary_country.lower() == "india" else 1.00,
-        "amount_inr": round(max(typical_txn, 5000), 2),
+        "amount_usd": round(max(typical_txn, 250.0), 2),
         "purpose": "Family maintenance",
         "remark": "",
         "transfer_type": "Transfer Immediately",
         "transfer_date": str(date.today()),
+        "transaction_timestamp": datetime.now().isoformat(),
         "country_of_residence": country,
         "risk_tier": str(customer_row.get("risk_tier", "Low")),
         "kyc_status": str(customer_row.get("kyc_status", "Verified")),
         "account_status": str(customer_row.get("account_status", "Active")),
         "preferred_channel": preferred_channel,
+        "channel": preferred_channel,
+        "device_used": primary_device,
     }
 
 
@@ -182,6 +196,7 @@ def init_state():
             "from_account": "",
             "from_account_name": "ACCOUNT",
             "available_balance": 0.0,
+            "beneficiary_id": "",
             "beneficiary_name": "",
             "beneficiary_account": "",
             "beneficiary_country": "",
@@ -189,16 +204,19 @@ def init_state():
             "beneficiary_branch": "",
             "beneficiary_town": "",
             "exchange_rate": 239.58,
-            "amount_inr": 15000.0,
+            "amount_usd": 1500.0,
             "purpose": "Family maintenance",
             "remark": "",
             "transfer_type": "Transfer Immediately",
             "transfer_date": str(date.today()),
+            "transaction_timestamp": datetime.now().isoformat(),
             "country_of_residence": "",
             "risk_tier": "",
             "kyc_status": "",
             "account_status": "",
             "preferred_channel": "",
+            "channel": "",
+            "device_used": "",
         },
         "risk_result": None,
         "login_error": "",
@@ -426,16 +444,16 @@ def blue_band(text):
 def compute_risk(data):
     score = 0
     triggered = []
-    amount = float(data.get("amount_inr", 0))
+    amount = float(data.get("amount_usd", 0))
     country = data.get("beneficiary_country", "").lower()
     purpose = data.get("purpose", "").lower()
 
-    if amount >= 20000:
+    if amount >= 5000:
         score += 30
-        triggered.append("High transfer amount (≥ INR 20,000)")
-    elif amount >= 10000:
+        triggered.append("High transfer amount (≥ USD 5,000)")
+    elif amount >= 2000:
         score += 15
-        triggered.append("Moderate transfer amount (≥ INR 10,000)")
+        triggered.append("Moderate transfer amount (≥ USD 2,000)")
 
     if country not in ["oman", "india", ""]:
         score += 35
@@ -708,6 +726,7 @@ elif st.session_state.screen == "beneficiary":
         st.markdown('<div class="bene-overlay-marker"></div>', unsafe_allow_html=True)
         if st.button(" ", key=f"sel_{i}"):
             td = st.session_state.transfer_data
+            td["beneficiary_id"] = b["beneficiary_id"]
             td["beneficiary_name"] = b["name"]
             td["beneficiary_account"] = b["account"]
             td["beneficiary_bank"] = b["bank"]
@@ -740,7 +759,7 @@ elif st.session_state.screen == "details":
       <div style="font-size:12px;color:#6B7280;margin-bottom:3px;">From Account</div>
       <div style="font-size:15px;font-weight:600;color:#111827;">{td['from_account']}</div>
       <div style="font-size:13px;color:#374151;">{td['from_account_name']}</div>
-      <div style="font-size:13px;color:#1456D8;font-weight:500;margin-top:4px;">Balance: OMR {td['available_balance']:.3f}</div>
+      <div style="font-size:13px;color:#1456D8;font-weight:500;margin-top:4px;">Balance: USD {td['available_balance']:.2f}</div>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"""
@@ -751,16 +770,15 @@ elif st.session_state.screen == "details":
       <div style="font-size:13px;color:#374151;">{td['beneficiary_bank']} · {td['beneficiary_country']}</div>
     </div>""", unsafe_allow_html=True)
 
-    currency_label = "INR" if str(td.get("beneficiary_country", "")).strip().lower() == "india" else "Amount"
-    exch_text = f'💱  1 OMR = {td["exchange_rate"]} INR' if td["exchange_rate"] != 1.0 else "💱  Standard transfer rate applied"
-    st.markdown(f'<div style="background:#FFF8E7;border-radius:10px;padding:9px 12px;font-size:13px;color:#7D4E00;margin-bottom:14px;">{exch_text}</div>', unsafe_allow_html=True)
+    st.markdown('<div style="background:#FFF8E7;border-radius:10px;padding:9px 12px;font-size:13px;color:#7D4E00;margin-bottom:14px;">Fraud checks use USD only. The OMR figure below is just a display equivalent.</div>', unsafe_allow_html=True)
 
-    st.markdown(f'<p style="color:#374151;font-size:14px;font-weight:500;margin-bottom:4px;">Amount ({currency_label})</p>', unsafe_allow_html=True)
-    amount = st.number_input("amount_lbl", min_value=0.0, value=float(td["amount_inr"]), step=500.0, label_visibility="collapsed")
-    td["amount_inr"] = amount
+    st.markdown('<p style="color:#374151;font-size:14px;font-weight:500;margin-bottom:4px;">Amount (USD)</p>', unsafe_allow_html=True)
+    amount = st.number_input("amount_lbl", min_value=0.0, value=float(td["amount_usd"]), step=100.0, label_visibility="collapsed")
+    td["amount_usd"] = amount
+    td["transaction_timestamp"] = datetime.now().isoformat()
 
-    omr_equiv = amount / td["exchange_rate"] if td["exchange_rate"] else amount
-    st.markdown(f'<div style="font-size:13px;color:#6B7280;margin-top:-8px;margin-bottom:12px;">≈ OMR {omr_equiv:.3f} will be debited</div>', unsafe_allow_html=True)
+    omr_equiv = amount / 2.60 if 2.60 else amount
+    st.markdown(f'<div style="font-size:13px;color:#6B7280;margin-top:-8px;margin-bottom:12px;">Display equivalent: ≈ OMR {omr_equiv:.3f}</div>', unsafe_allow_html=True)
 
     st.markdown('<p style="color:#374151;font-size:14px;font-weight:500;margin-bottom:4px;">Transfer Timing</p>', unsafe_allow_html=True)
     transfer_type = st.radio(
@@ -807,7 +825,7 @@ elif st.session_state.screen == "details":
 
 elif st.session_state.screen == "confirm":
     td = st.session_state.transfer_data
-    omr_debit = td["amount_inr"] / td["exchange_rate"] if td["exchange_rate"] else td["amount_inr"]
+    omr_debit = td["amount_usd"] / 2.60 if 2.60 else td["amount_usd"]
     top_bar(show_user=True)
     section_title("Confirm Transaction")
     st.markdown('<div style="padding:14px 16px;">', unsafe_allow_html=True)
@@ -826,9 +844,9 @@ elif st.session_state.screen == "confirm":
     blue_band("Transfer Amount")
     st.markdown(f"""
     <div style="background:white;border:1px solid #E5E7EB;border-top:none;border-radius:0 0 14px 14px;padding:4px 14px 4px;">
-      {row_pair("Amount", f"{td['amount_inr']:,.2f}")}
-      {row_pair("Service Charges", "OMR 0.000")}
-      {row_pair("Debit Amount", f"OMR {omr_debit:.3f}")}
+      {row_pair("Amount", f"USD {td['amount_usd']:,.2f}")}
+      {row_pair("Service Charges", "USD 0.00")}
+      {row_pair("Debit Amount", f"USD {td['amount_usd']:,.2f}")}
     </div>""", unsafe_allow_html=True)
 
     blue_band("Beneficiary Details")
@@ -902,7 +920,9 @@ elif st.session_state.screen == "otp":
         if st.button("Submit OTP", key="otp_submit"):
             with st.spinner("Verifying transaction..."):
                 if run_fraud_check is not None:
+                    print("[app1_updated] TRANSFER DATA:", st.session_state.transfer_data)
                     st.session_state.risk_result = run_fraud_check(st.session_state.transfer_data)
+                    print("[app1_updated] RISK RESULT:", st.session_state.risk_result)
                 else:
                     st.session_state.risk_result = compute_risk(st.session_state.transfer_data)
             go("result")
@@ -932,7 +952,7 @@ elif st.session_state.screen == "result":
                 border:1px solid #C6EDD9;text-align:center;">
       <div style="font-size:28px;">✓</div>
       <div style="font-size:16px;font-weight:700;color:#12805C;margin-top:4px;">Transfer Submitted Successfully</div>
-      <div style="font-size:13px;color:#374151;margin-top:4px;">{td['amount_inr']:,.2f} → {td['beneficiary_name']}</div>
+      <div style="font-size:13px;color:#374151;margin-top:4px;">USD {td['amount_usd']:,.2f} → {td['beneficiary_name']}</div>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"""
@@ -953,7 +973,7 @@ elif st.session_state.screen == "result":
                 border-radius:0 0 14px 14px;padding:4px 14px 10px;margin-bottom:14px;">
       {row_pair("Customer", td.get('customer_name', ''))}
       {row_pair("Beneficiary", td['beneficiary_name'])}
-      {row_pair("Amount", f"{td['amount_inr']:,.2f}")}
+      {row_pair("Amount", f"USD {td['amount_usd']:,.2f}")}
       {row_pair("Country", td['beneficiary_country'])}
       {row_pair("Purpose", td['purpose'])}
       {row_pair("Date", td['transfer_date'])}

@@ -18,7 +18,7 @@ HOW TO WIRE INTO app1.py
    result["triggered"] exactly as before.
 
 ACTION MATRIX:
-    Low    → no action
+    Low    → send WhatsApp action-required message to customer
     Medium → send fraud alert email to compliance team
     High   → send escalated fraud alert email to compliance team
 """
@@ -37,6 +37,7 @@ if str(CORE_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_MODEL_DIR))
 
 from communication.gmail_sender import send_email, send_fraud_alert
+from communication.whatsapp_sender import send_low_risk_action_required
 from core_model.predict_fraud import FraudPredictor
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -151,6 +152,8 @@ def _enrich_transfer_data(transfer_data: dict, predictor: FraudPredictor | None 
             td.setdefault("risk_tier", str(customer.get("risk_tier", "")))
             td.setdefault("kyc_status", str(customer.get("kyc_status", "")))
             td.setdefault("account_status", str(customer.get("account_status", "")))
+            td.setdefault("customer_phone", str(customer.get("phone", "")))
+            td.setdefault("phone", str(customer.get("phone", "")))
             td.setdefault(
                 "from_account_name",
                 f"{str(customer.get('preferred_channel', 'Mobile App')).upper()} ACCOUNT",
@@ -328,6 +331,28 @@ def _send_alert_email(result: dict, td: dict, level: str) -> bool:
         return False
 
 
+def _send_low_risk_whatsapp(td: dict) -> bool:
+    """Send a low-risk customer WhatsApp message and return success state."""
+    try:
+        recipient_phone = (
+            td.get("customer_phone")
+            or td.get("phone")
+        )
+        response = send_low_risk_action_required(
+            recipient_phone=recipient_phone,
+            amount_usd=float(td.get("amount_usd", 0)),
+            transaction_date=td.get("transaction_timestamp", datetime.now().isoformat()),
+            account_last_4=str(td.get("from_account", ""))[-4:],
+            channel=td.get("channel", "iMobile"),
+        )
+        print(f"  [fraud_bridge] WhatsApp sent → {recipient_phone} | sid={response.get('sid', '-')}")
+        return True
+    except Exception as e:
+        print(f"  [fraud_bridge] WhatsApp failed: {e}")
+        traceback.print_exc()
+        return False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,7 +370,7 @@ def run_fraud_check(transfer_data: dict) -> dict:
     Side effects:
         Medium risk → sends fraud alert email
         High risk   → sends escalated fraud alert email
-        Low risk    → no email
+        Low risk    → sends WhatsApp action-required message
     """
     print(f"\n[fraud_bridge] Checking: "
           f"{transfer_data.get('beneficiary_id') or transfer_data.get('beneficiary_name')} | "
@@ -376,11 +401,16 @@ def run_fraud_check(transfer_data: dict) -> dict:
     print(f"  [fraud_bridge] Result: {level} | Score: {result.get('score')} | "
           f"Alarm: {result.get('alarm_reason', '-')}")
 
-    # Send email for Medium and High
+    # Send notifications
     if level in ("Medium", "High"):
         result["email_sent"] = _send_alert_email(result, enriched_transfer_data, level)
+        result["whatsapp_sent"] = False
+    elif level == "Low":
+        result["email_sent"] = False
+        result["whatsapp_sent"] = _send_low_risk_whatsapp(enriched_transfer_data)
     else:
         result["email_sent"] = False
+        result["whatsapp_sent"] = False
         print(f"  [fraud_bridge] Low risk — no email")
 
     return result

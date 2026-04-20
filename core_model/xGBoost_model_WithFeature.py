@@ -31,9 +31,19 @@ from sklearn.metrics import (
 import xgboost as xgb
 import joblib
 from scipy.stats import uniform, randint
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import (
+    matthews_corrcoef, balanced_accuracy_score,
+    roc_auc_score, brier_score_loss
+)
+from matplotlib.gridspec import GridSpec
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.ticker as mticker
 
 warnings.filterwarnings("ignore")
 sns.set_theme(style="whitegrid", font_scale=1.1)
+SEARCH_N_JOBS = 1
 
 # ═══════════════════════════════════════════════════════════════════
 # PATHS
@@ -58,6 +68,7 @@ CHARTS_DIR = os.path.join(OUTPUT_DIR, "charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
 TARGET_COL = "label"
+DATETIME_HINTS = ("date", "timestamp", "dob", "birth")
 
 # Columns to drop: IDs, names, free-text, data-leakage
 DROP_COLS = [
@@ -413,6 +424,25 @@ def merge_and_engineer(all_sheets):
     return df
 
 
+def coerce_datetime_like_columns(df):
+    """Convert parseable date-like object columns to datetime for stable features."""
+    df = df.copy()
+    converted = []
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            converted.append(col)
+            continue
+        if not pd.api.types.is_object_dtype(df[col]):
+            continue
+        if not any(hint in col.lower() for hint in DATETIME_HINTS):
+            continue
+        parsed = pd.to_datetime(df[col], errors="coerce")
+        if parsed.notna().mean() >= 0.6:
+            df[col] = parsed
+            converted.append(col)
+    return df, converted
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 4. PREPROCESSING
 # ═══════════════════════════════════════════════════════════════════
@@ -435,6 +465,17 @@ def preprocess(df):
         le_target = LabelEncoder()
         y = pd.Series(le_target.fit_transform(y), name=TARGET_COL)
         print(f"  Target mapping: {dict(zip(le_target.classes_, le_target.transform(le_target.classes_)))}")
+
+    # Convert parseable date-like strings before encoding.
+    X, converted_datetime_cols = coerce_datetime_like_columns(X)
+    if converted_datetime_cols:
+        print(f"  Parsed datetime-like columns: {converted_datetime_cols}")
+
+    # Preserve numeric semantics for count/rate fields that may have landed as objects.
+    for col in X.select_dtypes(include=["object", "category"]).columns:
+        numeric_candidate = pd.to_numeric(X[col], errors="coerce")
+        if numeric_candidate.notna().mean() >= 0.98:
+            X[col] = numeric_candidate
 
     # Datetime → numeric components
     for col in X.select_dtypes(include=["datetime64", "datetimetz"]).columns:
@@ -543,7 +584,7 @@ def tune_hyperparameters(X_train, y_train):
         cv=cv,
         verbose=1,
         random_state=42,
-        n_jobs=-1,
+        n_jobs=SEARCH_N_JOBS,
         return_train_score=True,
     )
 
@@ -569,7 +610,7 @@ def train_model(X_train, y_train, X_val, y_val, best_params):
 
     model = xgb.XGBClassifier(
         **best_params,
-        eval_metric="aucpr",
+        eval_metric=["error", "logloss", "aucpr"],
         early_stopping_rounds=30,
         random_state=42,
         tree_method="hist",
@@ -583,7 +624,462 @@ def train_model(X_train, y_train, X_val, y_val, best_params):
 
     best_iter = model.best_iteration
     print(f"  ✓ Best iteration: {best_iter}")
-    return model
+    return model, model.evals_result()
+
+
+def compute_iteration_classification_metrics(model, X_train, y_train, X_val, y_val):
+    """
+    Capture classification quality after each boosting round.
+    This lets us inspect both the score at each iteration and the gain
+    compared with the previous iteration.
+    """
+    print("  Computing per-iteration accuracy and precision...")
+    total_rounds = len(model.evals_result().get("validation_0", {}).get("logloss", []))
+    if total_rounds == 0:
+        return pd.DataFrame()
+
+    rows = []
+    for iteration in range(1, total_rounds + 1):
+        train_proba = model.predict_proba(X_train, iteration_range=(0, iteration))[:, 1]
+        val_proba = model.predict_proba(X_val, iteration_range=(0, iteration))[:, 1]
+        train_pred = (train_proba >= 0.5).astype(int)
+        val_pred = (val_proba >= 0.5).astype(int)
+
+        rows.append({
+            "iteration": iteration,
+            "train_accuracy": accuracy_score(y_train, train_pred),
+            "val_accuracy": accuracy_score(y_val, val_pred),
+            "train_precision": precision_score(y_train, train_pred, zero_division=0),
+            "val_precision": precision_score(y_val, val_pred, zero_division=0),
+        })
+
+    metrics_df = pd.DataFrame(rows)
+    for col in ["train_accuracy", "val_accuracy", "train_precision", "val_precision"]:
+        metrics_df[f"{col}_increase"] = metrics_df[col].diff().fillna(metrics_df[col])
+
+    return metrics_df
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT A — Learning curves (loss, error, aucpr per iteration)
+# ═══════════════════════════════════════════════════════════════════
+def plot_learning_curves(evals_result, charts_dir):
+    """Plot train vs validation metrics across every boosting iteration."""
+    print("  Plotting learning curves...")
+    train_r = evals_result.get("validation_0", {})
+    val_r   = evals_result.get("validation_1", {})
+
+    metrics_to_plot = [k for k in train_r if k in val_r]
+    n = len(metrics_to_plot)
+    if n == 0:
+        return
+
+    fig, axes = plt.subplots(1, n, figsize=(7 * n, 5))
+    if n == 1:
+        axes = [axes]
+    fig.suptitle("Learning Curves — Train vs Validation per Iteration",
+                 fontsize=15, fontweight="bold")
+
+    metric_labels = {"error": "Classification Error", "logloss": "Log Loss", "aucpr": "PR-AUC"}
+    for ax, metric in zip(axes, metrics_to_plot):
+        iters = range(1, len(train_r[metric]) + 1)
+        ax.plot(iters, train_r[metric], lw=2, color="#1f77b4", label="Train")
+        ax.plot(iters, val_r[metric],   lw=2, color="#d62728", label="Validation", linestyle="--")
+        # Mark best iteration
+        if metric == "aucpr":
+            best_i = int(np.argmax(val_r[metric]))
+        else:
+            best_i = int(np.argmin(val_r[metric]))
+        ax.axvline(x=best_i+1, color="black", linestyle=":", alpha=0.6, lw=1.5)
+        ax.scatter(best_i+1, val_r[metric][best_i], s=80, zorder=5,
+                   color="black", label=f"Best iter={best_i+1}")
+        ax.set_title(metric_labels.get(metric, metric), fontweight="bold")
+        ax.set_xlabel("Boosting Iteration")
+        ax.set_ylabel("Score")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(charts_dir, "03a_learning_curves.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ Learning curves saved → {path}")
+
+
+def plot_iteration_metric_growth(iteration_metrics, charts_dir):
+    """Plot accuracy and precision trends plus their per-iteration increases."""
+    if iteration_metrics.empty:
+        return
+
+    print("  Plotting per-iteration accuracy and precision growth...")
+    fig, axes = plt.subplots(2, 2, figsize=(18, 10), sharex=True)
+    fig.suptitle("Per-Iteration Accuracy and Precision Growth", fontsize=15, fontweight="bold")
+
+    iters = iteration_metrics["iteration"]
+
+    axes[0, 0].plot(iters, iteration_metrics["train_accuracy"], lw=2, color="#1f77b4", label="Train")
+    axes[0, 0].plot(iters, iteration_metrics["val_accuracy"], lw=2, color="#d62728",
+                    linestyle="--", label="Validation")
+    axes[0, 0].set_title("Accuracy by Iteration", fontweight="bold")
+    axes[0, 0].set_ylabel("Accuracy")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(iters, iteration_metrics["train_precision"], lw=2, color="#1f77b4", label="Train")
+    axes[0, 1].plot(iters, iteration_metrics["val_precision"], lw=2, color="#d62728",
+                    linestyle="--", label="Validation")
+    axes[0, 1].set_title("Precision by Iteration", fontweight="bold")
+    axes[0, 1].set_ylabel("Precision")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].bar(iters, iteration_metrics["val_accuracy_increase"], color="#2ca02c", alpha=0.8)
+    axes[1, 0].axhline(0, color="black", lw=1)
+    axes[1, 0].set_title("Validation Accuracy Increase per Iteration", fontweight="bold")
+    axes[1, 0].set_xlabel("Boosting Iteration")
+    axes[1, 0].set_ylabel("Delta Accuracy")
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].bar(iters, iteration_metrics["val_precision_increase"], color="#ff7f0e", alpha=0.8)
+    axes[1, 1].axhline(0, color="black", lw=1)
+    axes[1, 1].set_title("Validation Precision Increase per Iteration", fontweight="bold")
+    axes[1, 1].set_xlabel("Boosting Iteration")
+    axes[1, 1].set_ylabel("Delta Precision")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(charts_dir, "03c_iteration_metric_growth.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ Iteration metric growth plot saved → {path}")
+
+
+def save_iteration_metrics(iteration_metrics, output_dir):
+    """Save raw per-iteration metrics for inspection in Excel or pandas."""
+    if iteration_metrics.empty:
+        return
+
+    path = os.path.join(output_dir, "iteration_metrics.csv")
+    iteration_metrics.to_csv(path, index=False)
+    print(f"  ✓ Iteration metrics saved → {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT B — Overfitting gap (train-val delta across iterations)
+# ═══════════════════════════════════════════════════════════════════
+def plot_overfitting_analysis(evals_result, charts_dir):
+    """Visualise the gap between train and validation metric per iteration."""
+    print("  Plotting overfitting analysis...")
+    train_r = evals_result.get("validation_0", {})
+    val_r   = evals_result.get("validation_1", {})
+
+    if "logloss" not in train_r:
+        return
+
+    iters = range(1, len(train_r["logloss"]) + 1)
+    gap   = [t - v for t, v in zip(train_r["logloss"], val_r["logloss"])]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Overfitting Analysis", fontsize=14, fontweight="bold")
+
+    # Left: both curves
+    axes[0].plot(iters, train_r["logloss"], lw=2, color="#1f77b4", label="Train Loss")
+    axes[0].plot(iters, val_r["logloss"],   lw=2, color="#d62728", label="Val Loss", linestyle="--")
+    axes[0].fill_between(iters, train_r["logloss"], val_r["logloss"],
+                          alpha=0.15, color="#ff7f0e", label="Gap (overfit region)")
+    axes[0].set_title("Log Loss — Train vs Validation")
+    axes[0].set_xlabel("Iteration"); axes[0].set_ylabel("Log Loss")
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    # Right: gap magnitude
+    gap_colors = ["#d62728" if g > 0.02 else "#ff7f0e" if g > 0.005 else "#2ca02c" for g in gap]
+    axes[1].bar(iters, gap, color=gap_colors, alpha=0.7, width=1.0)
+    axes[1].axhline(0, color="black", lw=1)
+    axes[1].set_title("Train-Val Loss Gap per Iteration\n(green=good, amber=watch, red=overfit)")
+    axes[1].set_xlabel("Iteration"); axes[1].set_ylabel("Gap (Train − Val Loss)")
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(charts_dir, "03b_overfitting_analysis.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ Overfitting analysis saved → {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT C — Hyperparameter search results
+# ═══════════════════════════════════════════════════════════════════
+def plot_hyperparameter_search(search, charts_dir):
+    """Visualise RandomizedSearchCV results to understand tuning landscape."""
+    print("  Plotting hyperparameter search results...")
+    results_df = pd.DataFrame(search.cv_results_)
+
+    fig = plt.figure(figsize=(20, 14))
+    fig.suptitle("Hyperparameter Search — RandomizedSearchCV (30 iterations × 5-fold)",
+                 fontsize=15, fontweight="bold")
+    gs = GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+
+    # 1. CV score distribution
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.hist(results_df["mean_test_score"], bins=15, color="#1f77b4",
+             edgecolor="white", alpha=0.85)
+    ax1.axvline(results_df["mean_test_score"].max(), color="#d62728",
+                lw=2, linestyle="--", label=f'Best={results_df["mean_test_score"].max():.4f}')
+    ax1.set_title("Distribution of CV F1 Scores", fontweight="bold")
+    ax1.set_xlabel("Mean CV F1 Score"); ax1.set_ylabel("Count")
+    ax1.legend(); ax1.grid(True, alpha=0.3)
+
+    # 2. Rank vs score
+    ax2 = fig.add_subplot(gs[0, 1])
+    sorted_df = results_df.sort_values("rank_test_score")
+    ax2.scatter(sorted_df["rank_test_score"], sorted_df["mean_test_score"],
+                c=sorted_df["mean_test_score"], cmap="RdYlGn", s=60, alpha=0.85, zorder=3)
+    ax2.set_title("Rank vs CV F1 Score", fontweight="bold")
+    ax2.set_xlabel("Rank (1 = best)"); ax2.set_ylabel("Mean CV F1")
+    ax2.grid(True, alpha=0.3)
+
+    # 3. Train vs Val score (overfitting in search)
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.scatter(results_df["mean_train_score"], results_df["mean_test_score"],
+                c=results_df["mean_test_score"], cmap="RdYlGn", s=60, alpha=0.85)
+    ax3.plot([0, 1], [0, 1], "k--", alpha=0.4, lw=1)
+    ax3.set_title("Train vs Validation F1\n(above diagonal = generalising well)", fontweight="bold")
+    ax3.set_xlabel("Mean Train F1"); ax3.set_ylabel("Mean Val F1")
+    ax3.grid(True, alpha=0.3)
+
+    # 4. n_estimators vs score
+    ax4 = fig.add_subplot(gs[1, 0])
+    if "param_n_estimators" in results_df:
+        ax4.scatter(results_df["param_n_estimators"].astype(float),
+                    results_df["mean_test_score"],
+                    c=results_df["mean_test_score"], cmap="viridis", s=60, alpha=0.85)
+        ax4.set_title("n_estimators vs CV F1", fontweight="bold")
+        ax4.set_xlabel("n_estimators"); ax4.set_ylabel("Mean CV F1")
+        ax4.grid(True, alpha=0.3)
+
+    # 5. learning_rate vs score
+    ax5 = fig.add_subplot(gs[1, 1])
+    if "param_learning_rate" in results_df:
+        ax5.scatter(results_df["param_learning_rate"].astype(float),
+                    results_df["mean_test_score"],
+                    c=results_df["mean_test_score"], cmap="viridis", s=60, alpha=0.85)
+        ax5.set_title("Learning Rate vs CV F1", fontweight="bold")
+        ax5.set_xlabel("learning_rate"); ax5.set_ylabel("Mean CV F1")
+        ax5.grid(True, alpha=0.3)
+
+    # 6. max_depth vs score
+    ax6 = fig.add_subplot(gs[1, 2])
+    if "param_max_depth" in results_df:
+        depth_vals = results_df["param_max_depth"].astype(float)
+        score_vals = results_df["mean_test_score"]
+        depth_groups = results_df.groupby("param_max_depth")["mean_test_score"]
+        means = depth_groups.mean()
+        ax6.bar(means.index.astype(str), means.values, color="#ff7f0e", alpha=0.8, edgecolor="white")
+        ax6.set_title("max_depth vs Mean CV F1", fontweight="bold")
+        ax6.set_xlabel("max_depth"); ax6.set_ylabel("Mean CV F1")
+        ax6.grid(True, alpha=0.3)
+
+    path = os.path.join(charts_dir, "05_hyperparameter_search.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ Hyperparameter search plot saved → {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT D — Extended evaluation plots
+# ═══════════════════════════════════════════════════════════════════
+def plot_extended_evaluation(y_test, y_pred, y_proba, model,
+                              feature_names, charts_dir):
+    """Additional deep-dive evaluation plots."""
+    print("  Plotting extended evaluation charts...")
+
+    fig = plt.figure(figsize=(22, 16))
+    fig.suptitle("Extended Model Evaluation", fontsize=16, fontweight="bold")
+    gs = GridSpec(3, 3, figure=fig, hspace=0.5, wspace=0.38)
+
+    # ── 1. Threshold analysis ──────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    thresholds = np.linspace(0.01, 0.99, 100)
+    precisions, recalls, f1s, accuracies = [], [], [], []
+    for thr in thresholds:
+        preds = (y_proba >= thr).astype(int)
+        precisions.append(precision_score(y_test, preds, zero_division=0))
+        recalls.append(recall_score(y_test, preds, zero_division=0))
+        f1s.append(f1_score(y_test, preds, zero_division=0))
+        accuracies.append(accuracy_score(y_test, preds))
+    best_thr_idx = int(np.argmax(f1s))
+    ax1.plot(thresholds, precisions, lw=2, label="Precision", color="#1f77b4")
+    ax1.plot(thresholds, recalls,    lw=2, label="Recall",    color="#d62728")
+    ax1.plot(thresholds, f1s,        lw=2, label="F1",        color="#2ca02c")
+    ax1.axvline(thresholds[best_thr_idx], color="black", linestyle="--",
+                lw=1.5, label=f"Best F1 thr={thresholds[best_thr_idx]:.2f}")
+    ax1.set_title("Precision / Recall / F1 vs Threshold", fontweight="bold")
+    ax1.set_xlabel("Decision Threshold"); ax1.set_ylabel("Score")
+    ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
+
+    # ── 2. Calibration curve ───────────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    frac_pos, mean_pred = calibration_curve(y_test, y_proba, n_bins=10)
+    ax2.plot(mean_pred, frac_pos, "s-", lw=2, color="#ff7f0e", label="Model")
+    ax2.plot([0, 1], [0, 1], "k--", lw=1.5, label="Perfect calibration")
+    ax2.fill_between(mean_pred, frac_pos, mean_pred,
+                     alpha=0.15, color="#ff7f0e", label="Calibration gap")
+    ax2.set_title("Calibration Curve\n(how well probabilities match reality)", fontweight="bold")
+    ax2.set_xlabel("Mean Predicted Probability")
+    ax2.set_ylabel("Fraction of Positives")
+    ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+
+    # ── 3. Cumulative gains chart ──────────────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    order   = np.argsort(y_proba)[::-1]
+    y_sorted = np.array(y_test)[order]
+    total_pos = y_sorted.sum()
+    gains = np.cumsum(y_sorted) / total_pos
+    pct_pop = np.arange(1, len(y_sorted)+1) / len(y_sorted)
+    ax3.plot(pct_pop, gains, lw=2.5, color="#1f77b4", label="Model")
+    ax3.plot([0, 1], [0, 1], "k--", lw=1.5, label="Random baseline")
+    ax3.fill_between(pct_pop, gains, pct_pop, alpha=0.15, color="#1f77b4", label="Lift area")
+    ax3.set_title("Cumulative Gains Curve", fontweight="bold")
+    ax3.set_xlabel("% of Population Scored")
+    ax3.set_ylabel("% of Fraud Captured")
+    ax3.legend(fontsize=8); ax3.grid(True, alpha=0.3)
+
+    # ── 4. Lift curve ──────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[1, 0])
+    lift  = gains / pct_pop
+    ax4.plot(pct_pop, lift, lw=2.5, color="#2ca02c")
+    ax4.axhline(1.0, color="black", linestyle="--", lw=1.5, alpha=0.6, label="No lift baseline")
+    ax4.set_title("Lift Curve\n(model vs random at each decile)", fontweight="bold")
+    ax4.set_xlabel("% of Population Scored")
+    ax4.set_ylabel("Lift")
+    ax4.legend(fontsize=8); ax4.grid(True, alpha=0.3)
+
+    # ── 5. Error analysis — FP / FN distribution ──────────────────
+    ax5 = fig.add_subplot(gs[1, 1])
+    fp_proba = y_proba[(y_test == 0) & (y_pred == 1)]   # False Positives
+    fn_proba = y_proba[(y_test == 1) & (y_pred == 0)]   # False Negatives
+    tp_proba = y_proba[(y_test == 1) & (y_pred == 1)]   # True Positives
+    tn_proba = y_proba[(y_test == 0) & (y_pred == 0)]   # True Negatives
+
+    ax5.hist(tn_proba, bins=30, alpha=0.6, color="#2ca02c",   label=f"TN ({len(tn_proba)})", density=True)
+    ax5.hist(tp_proba, bins=30, alpha=0.6, color="#1f77b4",   label=f"TP ({len(tp_proba)})", density=True)
+    ax5.hist(fp_proba, bins=30, alpha=0.8, color="#ff7f0e",   label=f"FP ({len(fp_proba)})", density=True)
+    ax5.hist(fn_proba, bins=30, alpha=0.8, color="#d62728",   label=f"FN ({len(fn_proba)})", density=True)
+    ax5.axvline(0.5, color="black", lw=1.5, linestyle="--")
+    ax5.set_title("Score Distribution by Prediction Outcome\n(FP/FN show where model struggles)", fontweight="bold")
+    ax5.set_xlabel("Predicted Probability"); ax5.set_ylabel("Density")
+    ax5.legend(fontsize=8); ax5.grid(True, alpha=0.3)
+
+    # ── 6. Top-20 feature importance (weight type) ────────────────
+    ax6 = fig.add_subplot(gs[1, 2])
+    booster   = model.get_booster()
+    imp_score = booster.get_score(importance_type="gain")
+    imp_df    = pd.DataFrame({"feature": list(imp_score.keys()),
+                               "importance": list(imp_score.values())})
+    imp_df    = imp_df.nlargest(20, "importance")
+    colors_fi = plt.cm.viridis(np.linspace(0.3, 0.9, len(imp_df)))
+    ax6.barh(imp_df["feature"], imp_df["importance"], color=colors_fi, edgecolor="white")
+    ax6.set_title("Top 20 Feature Importances (Gain)", fontweight="bold")
+    ax6.set_xlabel("Gain"); ax6.grid(True, alpha=0.3)
+
+    # ── 7. Feature importance — cover ─────────────────────────────
+    ax7 = fig.add_subplot(gs[2, 0])
+    imp_cover = booster.get_score(importance_type="cover")
+    imp_cdf   = pd.DataFrame({"feature": list(imp_cover.keys()),
+                               "cover": list(imp_cover.values())})
+    imp_cdf   = imp_cdf.nlargest(15, "cover")
+    ax7.barh(imp_cdf["feature"], imp_cdf["cover"], color="#ff7f0e", edgecolor="white")
+    ax7.set_title("Top 15 Feature Importances (Cover)", fontweight="bold")
+    ax7.set_xlabel("Cover"); ax7.grid(True, alpha=0.3)
+
+    # ── 8. Feature importance — frequency ─────────────────────────
+    ax8 = fig.add_subplot(gs[2, 1])
+    imp_freq  = booster.get_score(importance_type="weight")
+    imp_fdf   = pd.DataFrame({"feature": list(imp_freq.keys()),
+                               "weight": list(imp_freq.values())})
+    imp_fdf   = imp_fdf.nlargest(15, "weight")
+    ax8.barh(imp_fdf["feature"], imp_fdf["weight"], color="#9467bd", edgecolor="white")
+    ax8.set_title("Top 15 Feature Importances (Frequency/Weight)", fontweight="bold")
+    ax8.set_xlabel("Frequency"); ax8.grid(True, alpha=0.3)
+
+    # ── 9. Extended metrics summary ────────────────────────────────
+    ax9 = fig.add_subplot(gs[2, 2])
+    mcc       = matthews_corrcoef(y_test, y_pred)
+    bal_acc   = balanced_accuracy_score(y_test, y_pred)
+    brier     = brier_score_loss(y_test, y_proba)
+    roc_auc   = roc_auc_score(y_test, y_proba)
+    ext_metrics = {
+        "MCC": round(mcc, 4),
+        "Balanced Acc.": round(bal_acc, 4),
+        "Brier Score": round(brier, 4),
+        "ROC-AUC": round(roc_auc, 4),
+        "F1 @ 0.5": round(f1_score(y_test, y_pred), 4),
+        "Precision @ 0.5": round(precision_score(y_test, y_pred, zero_division=0), 4),
+        "Recall @ 0.5": round(recall_score(y_test, y_pred, zero_division=0), 4),
+    }
+    bar_cols = ["#2ca02c" if v >= 0.85 else "#ff7f0e" if v >= 0.6 else "#d62728"
+                for v in ext_metrics.values()]
+    bars = ax9.barh(list(ext_metrics.keys()), list(ext_metrics.values()),
+                    color=bar_cols, edgecolor="white")
+    ax9.set_xlim(-0.05, 1.1)
+    ax9.set_title("Extended Metrics Summary", fontweight="bold")
+    for bar, val in zip(bars, ext_metrics.values()):
+        ax9.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
+                 f"{val:.4f}", va="center", fontsize=9, fontweight="bold")
+    ax9.grid(True, alpha=0.3)
+
+    path = os.path.join(charts_dir, "04b_extended_evaluation.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ Extended evaluation saved → {path}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PLOT E — Cross-validation per-fold detail
+# ═══════════════════════════════════════════════════════════════════
+def plot_cv_fold_detail(cv_results, charts_dir):
+    """Show each fold's individual score to spot instability."""
+    print("  Plotting CV fold detail...")
+    metrics  = list(cv_results.keys())
+    n_folds  = len(cv_results[metrics[0]]["scores"])
+    fold_labels = [f"Fold {i+1}" for i in range(n_folds)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("Cross-Validation — Per-Fold Score Detail", fontsize=14, fontweight="bold")
+
+    # Left: grouped bar per metric
+    x    = np.arange(n_folds)
+    w    = 0.15
+    cmap = plt.cm.tab10
+    for i, metric in enumerate(metrics):
+        scores = cv_results[metric]["scores"]
+        axes[0].bar(x + i*w, scores, width=w, label=metric,
+                    color=cmap(i/len(metrics)), edgecolor="white", alpha=0.85)
+    axes[0].set_xticks(x + w*(len(metrics)-1)/2)
+    axes[0].set_xticklabels(fold_labels)
+    axes[0].set_ylim(0, 1.1)
+    axes[0].set_title("All Metrics by Fold", fontweight="bold")
+    axes[0].set_ylabel("Score"); axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3, axis="y")
+
+    # Right: box-plot style spread
+    data   = [cv_results[m]["scores"] for m in metrics]
+    bp     = axes[1].boxplot(data, labels=metrics, patch_artist=True, notch=False)
+    colors = [cmap(i/len(metrics)) for i in range(len(metrics))]
+    for patch, col in zip(bp["boxes"], colors):
+        patch.set_facecolor(col); patch.set_alpha(0.75)
+    for median_line in bp["medians"]:
+        median_line.set_color("black"); median_line.set_linewidth(2)
+    axes[1].set_title("Score Spread per Metric (variance = stability)", fontweight="bold")
+    axes[1].set_ylabel("Score"); axes[1].set_ylim(0.8, 1.05)
+    axes[1].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(charts_dir, "07_cv_fold_detail.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✓ CV fold detail saved → {path}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -592,6 +1088,78 @@ def train_model(X_train, y_train, X_val, y_val, best_params):
 def evaluate_model(model, X_test, y_test, feature_names, charts_dir, label="Original"):
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        "accuracy": round(accuracy_score(y_test, y_pred), 4),
+        "precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
+        "recall": round(recall_score(y_test, y_pred, zero_division=0), 4),
+        "f1_score": round(f1_score(y_test, y_pred, zero_division=0), 4),
+        "roc_auc": round(roc_auc_score(y_test, y_proba), 4),
+        "pr_auc": round(average_precision_score(y_test, y_proba), 4),
+    }
+
+    print(f"\n  ── {label} Features — Metrics ──")
+    for k, v in metrics.items():
+        print(f"    {k:15s}: {v}")
+
+    print(f"\n  ── Classification Report ({label}) ──")
+    print(classification_report(y_test, y_pred, target_names=["Legit", "Fraud"]))
+
+    return metrics, y_pred, y_proba
+
+
+def fit_probability_calibrator(model, X_val, y_val):
+    """Fit an isotonic calibrator on validation probabilities and save score scaling."""
+    print("\n  Fitting probability calibrator on validation set...")
+    raw_val_proba = model.predict_proba(X_val)[:, 1]
+    calibrator = IsotonicRegression(out_of_bounds="clip")
+    calibrator.fit(raw_val_proba, y_val)
+    isotonic_val = calibrator.predict(raw_val_proba)
+    blend_alpha = 0.65
+    calibrated_val = blend_alpha * raw_val_proba + (1 - blend_alpha) * isotonic_val
+    lower_bound = float(np.quantile(calibrated_val, 0.05))
+    upper_bound = float(np.quantile(calibrated_val, 0.95))
+    if upper_bound <= lower_bound:
+        upper_bound = lower_bound + 1e-6
+
+    calibration_meta = {
+        "method": "isotonic",
+        "x_thresholds": [float(v) for v in calibrator.X_thresholds_],
+        "y_thresholds": [float(v) for v in calibrator.y_thresholds_],
+        "blend_alpha": blend_alpha,
+        "ml_score_scale": {
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+        },
+    }
+    print(
+        "  ✓ Calibration fitted "
+        f"(5th pct={lower_bound:.4f}, 95th pct={upper_bound:.4f})"
+    )
+    return calibration_meta
+
+
+def apply_calibration(probabilities, calibration_meta):
+    """Apply saved isotonic calibration metadata to raw probabilities."""
+    if not calibration_meta:
+        return probabilities
+    if calibration_meta.get("method") != "isotonic":
+        return probabilities
+    x_thresholds = np.array(calibration_meta.get("x_thresholds", []), dtype=float)
+    y_thresholds = np.array(calibration_meta.get("y_thresholds", []), dtype=float)
+    if len(x_thresholds) == 0 or len(y_thresholds) == 0:
+        return probabilities
+    isotonic_probs = np.interp(probabilities, x_thresholds, y_thresholds)
+    blend_alpha = float(calibration_meta.get("blend_alpha", 0.65))
+    return blend_alpha * probabilities + (1 - blend_alpha) * isotonic_probs
+
+
+def evaluate_calibrated_model(model, X_test, y_test, feature_names, charts_dir,
+                              calibration_meta, label="Calibrated"):
+    """Evaluate the model using calibrated probabilities."""
+    raw_proba = model.predict_proba(X_test)[:, 1]
+    y_proba = apply_calibration(raw_proba, calibration_meta)
+    y_pred = (y_proba >= 0.5).astype(int)
 
     metrics = {
         "accuracy": round(accuracy_score(y_test, y_pred), 4),
@@ -705,7 +1273,7 @@ def cross_validate_final(best_params, X, y, charts_dir):
     scoring_metrics = ["accuracy", "f1", "precision", "recall", "roc_auc"]
     cv_results = {}
     for metric in scoring_metrics:
-        scores = cross_val_score(cv_model, X, y, cv=cv, scoring=metric, n_jobs=-1)
+        scores = cross_val_score(cv_model, X, y, cv=cv, scoring=metric, n_jobs=SEARCH_N_JOBS)
         cv_results[metric] = {"mean": round(scores.mean(), 4), "std": round(scores.std(), 4), "scores": scores}
         print(f"  {metric:12s}: {scores.mean():.4f} ± {scores.std():.4f}  {np.round(scores, 4)}")
 
@@ -734,7 +1302,8 @@ def cross_validate_final(best_params, X, y, charts_dir):
 # 12. SAVE ARTIFACTS
 # ═══════════════════════════════════════════════════════════════════
 def save_artifacts(model, X, best_params, metrics_orig,
-                    cv_results, label_encoders, le_target, output_dir):
+                    cv_results, label_encoders, le_target, output_dir,
+                    inference_config, calibration_meta):
     print("\n" + "=" * 70)
     print("  STEP 10: SAVING MODEL & ARTIFACTS")
     print("=" * 70)
@@ -759,6 +1328,8 @@ def save_artifacts(model, X, best_params, metrics_orig,
         "cross_validation": {k: {"mean": v["mean"], "std": v["std"]}
                               for k, v in cv_results.items()},
         "label_encoders": {col: list(le.classes_) for col, le in label_encoders.items()},
+        "inference_config": inference_config,
+        "probability_calibration": calibration_meta,
     }
     if le_target:
         meta["target_mapping"] = dict(zip(
@@ -799,21 +1370,55 @@ def main():
     best_params, search = tune_hyperparameters(X_train, y_train)
 
     # 7. Train final model
-    model = train_model(X_train, y_train, X_val, y_val, best_params)
+    model, evals_result = train_model(X_train, y_train, X_val, y_val, best_params)
+    iteration_metrics = compute_iteration_classification_metrics(
+        model, X_train, y_train, X_val, y_val
+    )
+    calibration_meta = fit_probability_calibrator(model, X_val, y_val)
+
+    # 7a. Learning curves (per-iteration train vs val)
+    plot_learning_curves(evals_result, CHARTS_DIR)
+
+    # 7b. Accuracy / precision growth per iteration
+    plot_iteration_metric_growth(iteration_metrics, CHARTS_DIR)
+    save_iteration_metrics(iteration_metrics, OUTPUT_DIR)
+
+    # 7c. Overfitting gap analysis
+    plot_overfitting_analysis(evals_result, CHARTS_DIR)
+
+    # 7d. Hyperparameter search landscape
+    plot_hyperparameter_search(search, CHARTS_DIR)
 
     # 8. Evaluate
-    metrics_orig, y_pred, y_proba = evaluate_model(
-        model, X_test, y_test, list(X.columns), CHARTS_DIR, label="Original"
+    metrics_orig, y_pred, y_proba = evaluate_calibrated_model(
+        model, X_test, y_test, list(X.columns), CHARTS_DIR, calibration_meta,
+        label="Calibrated"
     )
     plot_evaluation_dashboard(y_test, y_pred, y_proba, metrics_orig,
                                list(X.columns), model, CHARTS_DIR)
 
+    # 8b. Extended evaluation (threshold, calibration, lift, FP/FN, 3 importance types)
+    plot_extended_evaluation(y_test, y_pred, y_proba, model,
+                              list(X.columns), CHARTS_DIR)
+
     # 9. Cross-validation
     cv_results = cross_validate_final(best_params, X, y, CHARTS_DIR)
 
+    # 9b. CV per-fold detail
+    plot_cv_fold_detail(cv_results, CHARTS_DIR)
+
+    inference_config = {
+        "high_value_amount_threshold": round(float(df["amount_usd"].median()) * 2, 2),
+        "scoring_config": {
+            "weights": {"ml": 0.7, "yaml": 0.3},
+            "thresholds": {"medium_min": 35, "high_min": 70},
+        },
+    }
+
     # 10. Save
     save_artifacts(model, X, best_params, metrics_orig,
-                   cv_results, label_encoders, le_target, OUTPUT_DIR)
+                   cv_results, label_encoders, le_target, OUTPUT_DIR,
+                   inference_config, calibration_meta)
 
     # Final summary
     print("\n" + "█" * 70)

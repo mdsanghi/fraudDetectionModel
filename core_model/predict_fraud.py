@@ -2,16 +2,16 @@
 Fraud Detection — Real-Time Prediction Module
 ==============================================
 Composite scoring:
-    composite_score = 0.60 x ml_score  +  0.40 x yaml_score_normalised
+    composite_score = ml_weight x ml_score  +  yaml_weight x yaml_score_normalised
 
 Where:
-    ml_score              = XGBoost probability * 100  (0-100)
+    ml_score              = calibrated ML risk score  (0-100)
     yaml_score_normalised = (sum of fired rule scores / max possible score) * 100
     composite_score       = 0-100
 
 Risk levels (applied to composite_score):
-    Low    <  30
-    Medium  30-69
+    Low    <  35
+    Medium  35-69
     High   >= 70
 
 Safety net — ALWAYS raises High alarm if:
@@ -44,12 +44,13 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-COMPOSITE_LOW    = 30
+COMPOSITE_LOW    = 35
 COMPOSITE_MEDIUM = 69
 COMPOSITE_HIGH   = 70
 
 # Raw YAML score above this always triggers High regardless of ML
 YAML_HIGH_FLOOR  = 70
+DATETIME_HINTS   = ("date", "timestamp", "dob", "birth")
 
 HIGH_RISK_NATIONALITIES = {"NG", "RU", "CN", "BD"}
 
@@ -249,6 +250,13 @@ class FraudPredictor:
             col: {str(c): i for i, c in enumerate(classes)}
             for col, classes in self.metadata.get("label_encoders", {}).items()
         }
+        self.inference_config = self.metadata.get("inference_config", {})
+        self.probability_calibration = self.metadata.get("probability_calibration", {})
+        scoring_config = self.inference_config.get("scoring_config", {})
+        self.composite_weights = scoring_config.get("weights", {"ml": 0.7, "yaml": 0.3})
+        self.thresholds = scoring_config.get(
+            "thresholds", {"medium_min": COMPOSITE_LOW, "high_min": COMPOSITE_HIGH}
+        )
         print(f"  OK  Label encoders: {len(self.label_encoders)} columns")
 
         # ── Load YAML rules ────────────────────────────────────────────────────
@@ -275,6 +283,9 @@ class FraudPredictor:
         self._cust_bene = (self.df_beneficiaries
                            .groupby("customer_id")["beneficiary_id"]
                            .apply(set).to_dict())
+        self._customer_avg_amounts = (
+            self.df_transactions.groupby("customer_id")["amount_usd"].mean().to_dict()
+        )
 
         self.df_customers["registration_date"] = pd.to_datetime(
             self.df_customers["registration_date"], errors="coerce")
@@ -287,10 +298,17 @@ class FraudPredictor:
 
         self._login_feats = self._build_login_features()
         self._bene_feats  = self._build_beneficiary_features()
+        self.high_value_amount_threshold = float(
+            self.inference_config.get(
+                "high_value_amount_threshold",
+                round(float(self.df_transactions["amount_usd"].median()) * 2, 2),
+            )
+        )
 
         print(f"  OK  {len(self.df_customers)} customers | "
               f"{len(self.df_logins)} logins | "
-              f"{len(self.df_beneficiaries)} beneficiaries\n")
+              f"{len(self.df_beneficiaries)} beneficiaries")
+        print(f"  OK  High-value threshold: {self.high_value_amount_threshold:.2f} USD\n")
 
     # ── Pre-compute aggregates ─────────────────────────────────────────────────
 
@@ -345,6 +363,21 @@ class FraudPredictor:
         agg["has_very_recent_ben"] = (agg["newest_ben_days"] <= 7).astype(int)
         return agg.set_index("customer_id")
 
+    def _coerce_datetime_like_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert parseable date-like strings into datetime columns."""
+        df = df.copy()
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                continue
+            if not pd.api.types.is_object_dtype(df[col]):
+                continue
+            if not any(hint in col.lower() for hint in DATETIME_HINTS):
+                continue
+            parsed = pd.to_datetime(df[col], errors="coerce")
+            if parsed.notna().mean() >= 0.6:
+                df[col] = parsed
+        return df
+
     # ── Auto-derive all fraud flags ────────────────────────────────────────────
 
     def _derive_flags(self, txn: dict, cust: dict, bene: dict) -> dict:
@@ -364,7 +397,8 @@ class FraudPredictor:
         d["is_unusual_hour"]  = int(d["transaction_hour"] in range(0, 5))
 
         # Amount
-        avg = float(cust.get("typical_txn_amount", 0) or 1)
+        avg = float(self._customer_avg_amounts.get(txn.get("customer_id", ""), 0) or
+                    cust.get("typical_txn_amount", 0) or 1)
         amt = float(txn.get("amount_usd", 0))
         d["customer_avg_amount"]  = avg
         d["amount_vs_avg_ratio"]  = round(amt / avg, 4) if avg > 0 else 1.0
@@ -399,9 +433,10 @@ class FraudPredictor:
             logs = self.df_logins[self.df_logins["customer_id"] == cid].copy()
             logs["login_timestamp"] = pd.to_datetime(
                 logs["login_timestamp"], errors="coerce")
-            cutoff = now - timedelta(hours=24)
+            cutoff = txn_dt - timedelta(hours=24)
             d["login_attempts_before"] = int(len(
                 logs[(logs["login_timestamp"] >= cutoff) &
+                     (logs["login_timestamp"] <= txn_dt) &
                      (logs["login_status"] != "Success")]))
         else:
             d["login_attempts_before"] = 0
@@ -411,6 +446,7 @@ class FraudPredictor:
             logs = self.df_logins[self.df_logins["customer_id"] == cid].copy()
             logs["login_timestamp"] = pd.to_datetime(
                 logs["login_timestamp"], errors="coerce")
+            logs = logs[logs["login_timestamp"] <= txn_dt]
             last_log = logs.sort_values("login_timestamp").iloc[-1] if len(logs) > 0 else None
             d["recent_login_new_location"] = int(
                 last_log is not None and
@@ -496,9 +532,9 @@ class FraudPredictor:
         df["is_deep_night"]       = int(hr in range(0, 5))
         attempts = int(df["login_attempts_before"].iloc[0]) if "login_attempts_before" in df.columns else 0
         df["high_login_attempts"] = int(attempts >= 3)
-        df["high_value_txn"]      = int(amt > 400)
+        df["high_value_txn"]      = int(amt > self.high_value_amount_threshold)
         low_mfa = int(df["low_mfa_user"].iloc[0]) if "low_mfa_user" in df.columns else 0
-        df["no_mfa_high_value"]   = int(low_mfa == 1 and amt > 400)
+        df["no_mfa_high_value"]   = int(low_mfa == 1 and amt > self.high_value_amount_threshold)
 
         df["is_high_risk_customer"] = int(
             str(df["risk_tier"].iloc[0]).lower() == "high" if "risk_tier" in df.columns else False)
@@ -525,25 +561,36 @@ class FraudPredictor:
             if col in df.columns:
                 df.drop(columns=[col], inplace=True)
 
-        for col in df.select_dtypes(include=["datetime64","datetimetz"]).columns:
-            df[f"{col}_year"]      = df[col].dt.year
-            df[f"{col}_month"]     = df[col].dt.month
-            df[f"{col}_day"]       = df[col].dt.day
-            df[f"{col}_hour"]      = df[col].dt.hour
+        df = self._coerce_datetime_like_columns(df)
+
+        for col in df.select_dtypes(include=["object", "category"]).columns:
+            numeric_candidate = pd.to_numeric(df[col], errors="coerce")
+            if numeric_candidate.notna().mean() >= 0.98:
+                df[col] = numeric_candidate
+
+        for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
+            df[f"{col}_year"] = df[col].dt.year
+            df[f"{col}_month"] = df[col].dt.month
+            df[f"{col}_day"] = df[col].dt.day
+            df[f"{col}_hour"] = df[col].dt.hour
             df[f"{col}_dayofweek"] = df[col].dt.dayofweek
             df.drop(columns=[col], inplace=True)
 
         if "fraud_signal_count" in df.columns and "fraud_signal_count" in self.label_encoders:
             enc = self.label_encoders["fraud_signal_count"]
             val = str(int(df["fraud_signal_count"].iloc[0]))
-            df["fraud_signal_count"] = enc.get(val, -1)
+            df["fraud_signal_count"] = enc.get(val, 0)
 
+        unknown_encodings = {}
         for col, enc_dict in self.label_encoders.items():
-            if col == "fraud_signal_count":
-                continue
             if col not in df.columns:
                 continue
-            df[col] = enc_dict.get(str(df[col].iloc[0]), -1)
+            raw_val = str(df[col].iloc[0])
+            encoded = enc_dict.get(raw_val)
+            if encoded is None:
+                unknown_encodings[col] = raw_val
+                encoded = 0
+            df[col] = encoded
 
         for feat in self.feature_order:
             if feat not in df.columns:
@@ -553,20 +600,44 @@ class FraudPredictor:
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+        if unknown_encodings:
+            print(f"[predict_fraud] fallback encodings applied: {unknown_encodings}")
+
         return df, existing_flags
 
     # ── Composite scoring ──────────────────────────────────────────────────────
 
+    def _calibrate_probability(self, raw_probability: float) -> float:
+        """Apply saved isotonic calibration if available."""
+        meta = self.probability_calibration
+        if meta.get("method") != "isotonic":
+            return raw_probability
+        x_thresholds = np.array(meta.get("x_thresholds", []), dtype=float)
+        y_thresholds = np.array(meta.get("y_thresholds", []), dtype=float)
+        if len(x_thresholds) == 0 or len(y_thresholds) == 0:
+            return raw_probability
+        isotonic_probability = float(np.interp(raw_probability, x_thresholds, y_thresholds))
+        blend_alpha = float(meta.get("blend_alpha", 0.65))
+        return float(blend_alpha * raw_probability + (1 - blend_alpha) * isotonic_probability)
+
+    def _ml_risk_score(self, calibrated_probability: float) -> float:
+        """Convert calibrated probability into the ML component of the risk score."""
+        return round(calibrated_probability * 100, 2)
+
     def _composite_score(self, ml_score: float,
                          yaml_score_raw: int, max_yaml: int) -> float:
         """
-        composite = 0.60 * ml_score + 0.40 * yaml_normalised
+        composite = ml_weight * ml_score + yaml_weight * yaml_normalised
         ml_score        : 0-100
         yaml_score_raw  : sum of fired rule scores
         max_yaml        : sum of all rule scores (normalisation base)
         """
         yaml_norm = (yaml_score_raw / max_yaml * 100) if max_yaml > 0 else 0
-        return round(0.60 * ml_score + 0.40 * yaml_norm, 2)
+        ml_weight = float(self.composite_weights.get("ml", 0.7))
+        yaml_weight = float(self.composite_weights.get("yaml", 0.3))
+        return round(ml_weight * ml_score + yaml_weight * yaml_norm, 2)
+        # Take only ML score for testing
+        # return round(ml_score, 2)
 
     def _risk_level(self, composite: float, yaml_raw: int,
                     critical_fired: bool) -> tuple:
@@ -584,9 +655,11 @@ class FraudPredictor:
         if yaml_raw >= YAML_HIGH_FLOOR:
             return "High", "yaml_high_floor_exceeded"
         # Normal composite thresholds
-        if composite >= COMPOSITE_HIGH:
+        high_min = float(self.thresholds.get("high_min", COMPOSITE_HIGH))
+        medium_min = float(self.thresholds.get("medium_min", COMPOSITE_LOW))
+        if composite >= high_min:
             return "High", "composite_score"
-        if composite >= COMPOSITE_LOW:
+        if composite >= medium_min:
             return "Medium", "composite_score"
         return "Low", "composite_score"
 
@@ -617,8 +690,9 @@ class FraudPredictor:
         # ── Step 2: XGBoost ML score ───────────────────────────────────────────
         features_df, ml_flag_cols = self._build_features(transaction, derived)
         print(f"[predict_fraud] feature shape={features_df.shape}")
-        ml_probability = float(self.model.predict_proba(features_df)[0][1])
-        ml_score       = round(ml_probability * 100, 2)
+        raw_ml_probability = float(self.model.predict_proba(features_df)[0][1])
+        ml_probability = self._calibrate_probability(raw_ml_probability)
+        ml_score = self._ml_risk_score(ml_probability)
 
         ml_fired_flags = [
             f for f in ml_flag_cols
@@ -639,6 +713,7 @@ class FraudPredictor:
         yaml_norm = round((yaml_raw / max_yaml * 100), 2) if max_yaml > 0 else 0
         print(
             "[predict_fraud] scoring summary: "
+            f"raw_ml_probability={raw_ml_probability:.4f}, "
             f"ml_probability={ml_probability:.4f}, ml_score={ml_score}, "
             f"yaml_raw={yaml_raw}, yaml_norm={yaml_norm}, "
             f"critical_fired={critical_fired}, ml_flags={ml_fired_flags}"
@@ -667,12 +742,13 @@ class FraudPredictor:
             "composite_score":     composite,
             "ml_score":            ml_score,
             "ml_probability":      round(ml_probability, 4),
+            "raw_ml_probability":  round(raw_ml_probability, 4),
             "yaml_score_raw":      yaml_raw,
             "yaml_score_normalised": yaml_norm,
             "yaml_max_possible":   max_yaml,
 
             # Weights applied
-            "weights": {"ml": 0.60, "yaml": 0.40},
+            "weights": self.composite_weights,
 
             # Signals
             "ml_signals":     ml_fired_flags,
@@ -729,40 +805,43 @@ if __name__ == "__main__":
         for k, v in r["auto_derived"].items():
             print(f"      {k:<36} = {v}")
 
-    print_result("Test 1: Highly suspicious (night, new device, large spike, high-risk country)",
+    print_result("Test 1: Low-risk customer — regular beneficiary, daytime, normal amount",
         predictor.score_transaction({
-            "customer_id":      "CUST1042",
-            "beneficiary_id":   "BENE5001",
-            "amount_usd":       4500.00,
-            "transaction_type": "Wire Transfer",
-            "channel":          "Web Browser",
-            "device_used":      "Windows PC",
-            "transaction_date": "2026-04-10 03:15:00",
-        })
-    )
-
-    print_result("Test 2: Normal transaction",
-        predictor.score_transaction({
-            "customer_id":      "CUST1010",
-            "beneficiary_id":   "BENE5050",
-            "amount_usd":       150.00,
+            "customer_id":      "CUST1157",
+            "beneficiary_id":   "BENE5771",
+            "amount_usd":       1617.45,
             "transaction_type": "Bill Payment",
             "channel":          "Mobile App",
             "device_used":      "iPhone 14",
-            "transaction_date": "2026-04-10 14:30:00",
+            "transaction_date": "2026-04-10 13:30:00",
         })
     )
 
-    print_result("Test 3: NEW CUSTOMER — recent registration + cross-nationality",
+    print_result("Test 2: Medium-risk customer — regular beneficiary, daytime, normal amount",
         predictor.score_transaction({
-            "customer_id":      "CUST1000",  # 8 days old account!
-            "beneficiary_id":   "BENE5001",
-            "amount_usd":       3263.00,
-            "transaction_type": "Wire Transfer",
+            "customer_id":      "CUST1157",
+            "beneficiary_id":   "BENE5771",
+            "amount_usd":       4617.45,
+            "transaction_type": "Peer Transfer",
             "channel":          "Mobile App",
-            "device_used":      "Samsung S23",
+            "device_used":      "iPhone 14",
+            "transaction_date": "2026-04-10 3:30:00",
         })
     )
+
+    print_result("Test 3: HIGH-risk customer — regular beneficiary, daytime, normal amount",
+        predictor.score_transaction({
+            "customer_id":      "CUST1157",
+            "beneficiary_id":   "BENE5772",
+            "amount_usd":       4617.45,
+            "transaction_type": "Peer Transfer",
+            "channel":          "Mobile App",
+            "device_used":      "iPhone 7",
+            "transaction_date": "2026-04-10 3:30:00",
+        })
+    )
+
+    
 
     print(f"\n{'='*70}")
     print("  DEMO COMPLETE")

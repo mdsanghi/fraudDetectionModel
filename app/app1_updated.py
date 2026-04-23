@@ -240,17 +240,29 @@ st.markdown("""
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+:root {
+    --app-shell-height: 100vh;
+}
+
+@supports (height: 100dvh) {
+    :root {
+        --app-shell-height: 100dvh;
+    }
+}
+
 #MainMenu, footer, header { visibility: hidden; }
 .stDeployButton { display: none; }
 
 .stApp {
     background: #1456D8;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: var(--app-shell-height);
 }
 
 .block-container {
     max-width: 390px !important;
-    min-height: 100vh;
+    min-height: var(--app-shell-height);
+    height: var(--app-shell-height);
     padding: 0 !important;
     margin: 0 auto !important;
     margin-top: 24px !important;
@@ -377,6 +389,32 @@ div[data-testid="stAlert"] {
     border-radius: 12px !important;
     font-size: 15px !important;
 }
+
+@media (max-width: 480px) {
+    html, body, [data-testid="stAppViewContainer"], .stApp, section[data-testid="stMain"] {
+        height: var(--app-shell-height);
+        min-height: var(--app-shell-height);
+    }
+
+    section[data-testid="stMain"] > div:first-child {
+        padding-top: 0 !important;
+    }
+
+    .block-container {
+        max-width: 100vw !important;
+        min-height: var(--app-shell-height) !important;
+        height: var(--app-shell-height) !important;
+        margin: 0 !important;
+        border-radius: 0 !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    .block-container > div:first-child,
+    .block-container > div:last-child {
+        border-radius: 0 !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -411,9 +449,6 @@ def top_bar(show_user=False):
     user_row = f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0 2px;font-size:15px;font-weight:500;color:rgba(255,255,255,.9);"><span>{customer_name}</span><span style="font-size:13px;opacity:.8;">★ Rewards</span></div>' if show_user and customer_name else ""
     st.markdown(f"""
     <div style="background:#1456D8;padding:14px 18px 18px;color:white;">
-      <div style="display:flex;justify-content:space-between;font-size:13px;font-weight:600;margin-bottom:10px;opacity:.9;">
-        <span>9:41</span><span>📶 WiFi 🔋 88%</span>
-      </div>
       <div style="text-align:center;font-size:13px;font-weight:600;opacity:.85;letter-spacing:.5px;">البنك الوطني العماني</div>
       <div style="text-align:center;font-size:42px;font-weight:900;line-height:1.1;letter-spacing:1px;">NBO</div>
       {user_row}
@@ -478,39 +513,131 @@ def compute_risk(data):
 if st.session_state.screen == "login":
     st.markdown("""
     <style>
-    .stApp, body, .block-container {
-        background: #1456D8 !important;
+    .stApp, body {
+        background: linear-gradient(180deg, #1456D8 0%, #0F4CC2 100%) !important;
+    }
+    .block-container {
+        background: linear-gradient(180deg, #1456D8 0 34%, #F7F9FE 34% 100%) !important;
+        overflow-y: hidden !important;
+    }
+    [data-testid="stVerticalBlockBorderWrapper"] > div > div > [data-testid="stVerticalBlock"] {
+        gap: 0 !important;
     }
     [data-testid="stVerticalBlockBorderWrapper"] > div > div
       > [data-testid="stVerticalBlock"]
-      > div:nth-child(n+4) {
-        background: white;
+      > div:nth-child(n+3) {
+        background: #F7F9FE;
         padding-left: 22px !important;
         padding-right: 22px !important;
     }
-    div[data-testid="stTextInput"] { background: white !important; padding: 0 22px !important; }
-    .stButton { background: white !important; padding: 0 22px !important; }
+    [data-testid="stVerticalBlockBorderWrapper"] > div > div
+      > [data-testid="stVerticalBlock"]
+      > div:nth-child(3) {
+        border-radius: 30px 30px 0 0;
+        padding-top: 18px !important;
+    }
+    [data-testid="stVerticalBlockBorderWrapper"] > div > div
+      > [data-testid="stVerticalBlock"]
+      > div:last-child {
+        border-radius: 0 0 30px 30px;
+        padding-bottom: 20px !important;
+    }
+    div[data-testid="stTextInput"] {
+        background: transparent !important;
+        padding: 0 22px 8px !important;
+    }
+    div[data-testid="stTextInput"] > div {
+        background: #FFFFFF !important;
+        border: 1.5px solid #D7DEEE !important;
+        border-radius: 16px !important;
+        box-shadow: none !important;
+        overflow: hidden !important;
+    }
+    div[data-testid="stTextInput"] > div:focus-within {
+        border-color: #1456D8 !important;
+        box-shadow: 0 0 0 4px rgba(20, 86, 216, 0.12) !important;
+        transform: translateY(-1px);
+    }
+    div[data-testid="stTextInput"] input {
+        background: #FFFFFF !important;
+        border: 1.5px solid #D7DEEE !important;
+        border: none !important;
+        border-radius: 16px !important;
+        min-height: 56px !important;
+        padding: 14px 18px !important;
+        font-size: 17px !important;
+        box-shadow: none !important;
+        transition: box-shadow 0.18s ease, transform 0.18s ease !important;
+    }
+    div[data-testid="stTextInput"] input:focus {
+        border: none !important;
+        box-shadow: none !important;
+        transform: none !important;
+    }
+    div[data-testid="stTextInput"] button,
+    div[data-testid="stTextInput"] [role="button"] {
+        background: #FFFFFF !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #374151 !important;
+    }
+    div[data-testid="stTextInput"] svg {
+        fill: #374151 !important;
+    }
+    .stButton {
+        background: transparent !important;
+        padding: 6px 22px 0 !important;
+    }
+    .stButton > button {
+        min-height: 54px !important;
+        font-size: 18px !important;
+        box-shadow: 0 14px 28px rgba(20, 86, 216, 0.22) !important;
+    }
+    div[data-testid="stAlert"] {
+        margin: 8px 22px 0 !important;
+    }
+    .login-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.16);
+        border: 1px solid rgba(255,255,255,0.18);
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+    }
+    .login-hint-card {
+        background: linear-gradient(180deg, #FFFFFF 0%, #F1F5FE 100%);
+        border: 1px solid #E4EAF7;
+        border-radius: 18px;
+        padding: 14px 16px;
+        color: #41506A;
+        text-align: center;
+        box-shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
+    }
+    .login-hint-card strong {
+        color: #1456D8;
+    }
     </style>
     """, unsafe_allow_html=True)
 
     st.markdown("""
-    <div style="background:#1456D8;color:white;padding:18px 22px 24px;">
-      <div style="display:flex;justify-content:space-between;font-size:13px;
-           font-weight:600;opacity:.85;margin-bottom:18px;">
-        <span>9:41</span><span>📶 WiFi 🔋 88%</span>
-      </div>
+    <div style="background:transparent;color:white;padding:20px 22px 18px;">
       <div style="text-align:center;font-size:13px;font-weight:600;opacity:.8;
            letter-spacing:.5px;margin-bottom:5px;">البنك الوطني العماني</div>
       <div style="text-align:center;font-size:54px;font-weight:900;line-height:1;
-           letter-spacing:2px;margin-bottom:28px;">NBO</div>
-      <div style="font-size:21px;font-weight:700;margin-bottom:5px;">Welcome back 👋</div>
-      <div style="font-size:15px;opacity:.82;margin-bottom:0;">Enter customer ID and passcode to continue</div>
+           letter-spacing:2px;margin-bottom:16px;">NBO</div>
+      <div style="font-size:21px;font-weight:700;margin-bottom:5px;">Welcome back</div>
+      <div style="font-size:15px;opacity:.82;margin-bottom:12px;">Enter customer ID and passcode to continue</div>
+      
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("""
-    <div style="background:white;border-radius:28px 28px 0 0;padding:28px 22px 6px;
-         margin-top:0;border-top:0;">
+    <div style="background:transparent;padding:8px 22px 6px;
+         margin-top:32px;border-top:0;">
       <p style="color:#374151;font-size:14px;font-weight:600;margin:0 0 8px;">Customer ID</p>
     </div>
     """, unsafe_allow_html=True)
@@ -524,7 +651,7 @@ if st.session_state.screen == "login":
     )
     st.session_state.customer_id_input = customer_id
 
-    st.markdown('<div style="background:white;padding:8px 22px 6px;"><p style="color:#374151;font-size:14px;font-weight:600;margin:0 0 8px;">Passcode</p></div>', unsafe_allow_html=True)
+    st.markdown('<div style="background:transparent;padding:4px 22px 6px;"><p style="color:#374151;font-size:14px;font-weight:600;margin:0 0 8px;">Passcode</p></div>', unsafe_allow_html=True)
 
     passcode = st.text_input(
         "Passcode",
@@ -538,7 +665,7 @@ if st.session_state.screen == "login":
     if DATA_LOAD_ERROR:
         st.error(f"Unable to load workbook: {DATA_LOAD_ERROR}")
 
-    st.markdown('<div style="background:white;padding:12px 22px 0;margin-bottom:10px;"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="background:transparent;padding:4px 22px 0;"></div>', unsafe_allow_html=True)
 
     if st.button("Login", key="login_btn"):
         cid = customer_id.strip().upper()
@@ -563,12 +690,11 @@ if st.session_state.screen == "login":
         st.error(st.session_state.login_error)
 
     st.markdown("""
-    <div style="background:white;padding:20px 22px 32px;min-height:30vh;">
-      <div style="text-align:center;color:#9CA3AF;font-size:14px;margin-bottom:14px;">
-        Try a valid ID like <b>CUST1000</b></div>
-      <div style="text-align:center;font-size:44px;line-height:1.1;">🙂</div>
-      <div style="text-align:center;color:#374151;font-size:15px;
-           font-weight:600;margin:8px 0 14px;">Customer data will be loaded from Excel</div>
+    <div style="background:transparent;padding:14px 22px 20px;">
+      <div class="login-hint-card">
+        Try a valid ID like <strong>CUST1000</strong><br>
+        Customer data will be loaded directly from Excel.
+      </div>
     </div>
     """, unsafe_allow_html=True)
 

@@ -210,3 +210,13 @@ rules:
     required_features:
       - account_age_days
       - beneficiary_age_days
+
+  - id: R23
+    name: recently_added_beneficiary_5d
+    description: Beneficiary was added within the last 5 days and should raise at least Medium risk.
+    severity: medium
+    score: 15
+    when: beneficiary_age_days <= 5
+    source_sheet: Beneficiaries
+    required_features:
+      - beneficiary_age_days

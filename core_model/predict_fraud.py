@@ -51,6 +51,7 @@ COMPOSITE_HIGH   = 70
 # Raw YAML score above this always triggers High regardless of ML
 YAML_HIGH_FLOOR  = 70
 DATETIME_HINTS   = ("date", "timestamp", "dob", "birth")
+MEDIUM_FLOOR_RULE_IDS = {"R05", "R18", "R21", "R23"}
 
 
 def _parse_excelish_dates(values) -> pd.Series:
@@ -688,7 +689,8 @@ class FraudPredictor:
         # return round(ml_score, 2)
 
     def _risk_level(self, composite: float, yaml_raw: int,
-                    critical_fired: bool) -> tuple:
+                    critical_fired: bool, yaml_fired: list | None = None,
+                    auto_derived: dict | None = None) -> tuple:
         """
         Determine final risk level.
         Safety net ensures High is ALWAYS raised when:
@@ -709,6 +711,16 @@ class FraudPredictor:
             return "High", "composite_score"
         if composite >= medium_min:
             return "Medium", "composite_score"
+        fired_ids = {rule.get("id", "") for rule in (yaml_fired or [])}
+        auto = auto_derived or {}
+        medium_floor = bool(
+            fired_ids.intersection(MEDIUM_FLOOR_RULE_IDS)
+            or auto.get("is_new_beneficiary")
+            or auto.get("account_recent_5d")
+            or auto.get("beneficiary_recent_5d")
+        )
+        if medium_floor:
+            return "Medium", "medium_floor_signal"
         return "Low", "composite_score"
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -772,7 +784,7 @@ class FraudPredictor:
 
         # ── Step 5: Final risk level with safety net ───────────────────────────
         risk_level, alarm_reason = self._risk_level(
-            composite, yaml_raw, critical_fired)
+            composite, yaml_raw, critical_fired, yaml_fired=yaml_fired, auto_derived=derived)
         print(
             "[predict_fraud] final decision: "
             f"composite={composite}, risk_level={risk_level}, alarm_reason={alarm_reason}"

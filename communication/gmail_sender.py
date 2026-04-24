@@ -25,6 +25,7 @@ import smtplib
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Iterable, Optional, Union
+from urllib.parse import quote
 
 # Email configuration - Update these with your Gmail credentials
 SENDER_EMAIL = "mayank.pgcsmp01@iimtrichy.ac.in"  # Replace with your Gmail address
@@ -219,11 +220,198 @@ Sincerely,
     )
 
 
+def send_high_risk_confirmation_email(
+    recipient_email: str,
+    customer_name: str,
+    account_last_4: str,
+    amount: float,
+    beneficiary_name: str,
+    transaction_date: str,
+    transaction_reference: str,
+    currency: str = "USD",
+    bank_name: str = "National Bank of Oman",
+    reply_to_email: Optional[str] = "nbo.bank@om.nbo.om",
+    beneficiary_country: str = "",
+    purpose: str = "",
+    channel: str = "",
+    support_email: Optional[str] = None,
+    support_phone: str = "+968 2477 7777",
+) -> None:
+    """Send a red-header confirmation email for high-risk transactions."""
+    reply_to_email = reply_to_email or SENDER_EMAIL
+    support_email = support_email or reply_to_email
+    subject = f"Action Required: Confirm Transaction Ref {transaction_reference}"
+    confirm_subject = quote(f"Customer confirmation for transaction {transaction_reference}")
+    confirm_body_lines = [
+        f"To: {bank_name} Fraud Review Team,",
+        "",
+        "I confirm that I authorize the transaction referenced below and request the bank to proceed with processing.",
+        "",
+        f"Transaction Reference Number: {transaction_reference}",
+        f"Transaction Date: {transaction_date}",
+        f"Debit Account: Account ending in {account_last_4}",
+        f"Beneficiary: {beneficiary_name}",
+        f"Amount: {amount:.2f} {currency}",
+    ]
+    if beneficiary_country:
+        confirm_body_lines.append(f"Beneficiary Country: {beneficiary_country}")
+    if purpose:
+        confirm_body_lines.append(f"Purpose: {purpose}")
+    if channel:
+        confirm_body_lines.append(f"Channel: {channel}")
+    confirm_body_lines.extend([
+        "",
+        "Confirmation Statement:",
+        "I confirm the transaction.",
+        "",
+        f"Customer Name: {customer_name}",
+    ])
+    confirm_body = quote("\n".join(confirm_body_lines))
+    mailto_href = f"mailto:{reply_to_email}?subject={confirm_subject}&body={confirm_body}"
+    country_line = f"- Beneficiary Country: {beneficiary_country}\n" if beneficiary_country else ""
+    purpose_line = f"- Purpose: {purpose}\n" if purpose else ""
+    channel_line = f"- Channel: {channel}\n" if channel else ""
+    country_html = (
+        f"""
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Beneficiary Country</strong></td>
+                  <td style="padding: 8px 0; color: #111827;">{beneficiary_country}</td>
+                </tr>
+        """
+        if beneficiary_country else ""
+    )
+    purpose_html = (
+        f"""
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Purpose</strong></td>
+                  <td style="padding: 8px 0; color: #111827;">{purpose}</td>
+                </tr>
+        """
+        if purpose else ""
+    )
+    channel_html = (
+        f"""
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Channel</strong></td>
+                  <td style="padding: 8px 0; color: #111827;">{channel}</td>
+                </tr>
+        """
+        if channel else ""
+    )
+
+    body_text = f"""Dear {customer_name},
+
+We have temporarily placed a high-risk transaction on hold for additional verification on your {bank_name} account ending in {account_last_4}.
+
+Transaction Details:
+- Reference Number: {transaction_reference}
+- Date: {transaction_date}
+- Beneficiary: {beneficiary_name}
+- Account ending: {account_last_4}
+- Amount: {amount:.2f} {currency}
+{country_line}{purpose_line}{channel_line}
+To authorise processing of this transaction, please confirm it by replying with the exact text below:
+I confirm the transaction.
+Transaction Reference Number: {transaction_reference}
+
+If you do not recognise this transaction, do not confirm it. Please contact {bank_name} immediately at {support_phone} or {support_email}.
+"""
+
+    body_html = f"""
+    <!DOCTYPE html>
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f4f6fb; margin: 0; padding: 24px;">
+        <div style="max-width: 680px; margin: 0 auto; background-color: #ffffff; border-radius: 14px; overflow: hidden; box-shadow: 0 12px 36px rgba(15, 23, 42, 0.12); border: 1px solid #e5e7eb;">
+          <div style="background: linear-gradient(135deg, #b91c1c 0%, #dc2626 100%); color: #ffffff; padding: 24px 28px;">
+            <div style="font-size: 12px; letter-spacing: 1.2px; font-weight: 700; opacity: 0.92; text-transform: uppercase;">High Risk Transaction Review</div>
+            <h1 style="margin: 10px 0 6px 0; font-size: 28px; line-height: 1.2;">Customer Confirmation Required</h1>
+            <p style="margin: 0; font-size: 15px; line-height: 1.6; opacity: 0.95;">
+              The transaction below is currently on hold and will be processed only after we receive your confirmation.
+            </p>
+          </div>
+
+          <div style="padding: 30px 28px;">
+            <p style="font-size: 16px; color: #1f2937; margin-top: 0;">Dear <strong>{customer_name}</strong>,</p>
+            <p style="font-size: 16px; color: #4b5563; line-height: 1.7; margin-bottom: 18px;">
+              As part of our fraud prevention controls, we identified elevated risk indicators linked to a pending transaction on your account ending in <strong>{account_last_4}</strong>.
+              To protect your account, we require direct confirmation from you before the transaction can proceed.
+            </p>
+
+            <div style="background-color: #fff7f7; border: 1px solid #fecaca; border-radius: 12px; padding: 18px 20px; margin: 24px 0 18px 0;">
+              <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: #b91c1c; margin-bottom: 12px;">
+                Transaction Summary
+              </div>
+              <table style="width: 100%; border-collapse: collapse;">
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280; width: 42%;"><strong>Transaction Reference</strong></td>
+                  <td style="padding: 8px 0; color: #111827; font-weight: 700;">{transaction_reference}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Transaction Date</strong></td>
+                  <td style="padding: 8px 0; color: #111827;">{transaction_date}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Debit Account</strong></td>
+                  <td style="padding: 8px 0; color: #111827;">Account ending in {account_last_4}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Beneficiary</strong></td>
+                  <td style="padding: 8px 0; color: #111827;">{beneficiary_name}</td>
+                </tr>
+                {country_html}
+                {purpose_html}
+                {channel_html}
+                <tr>
+                  <td style="padding: 8px 0; color: #6b7280;"><strong>Amount</strong></td>
+                  <td style="padding: 8px 0; color: #b91c1c; font-size: 18px;"><strong>{amount:.2f} {currency}</strong></td>
+                </tr>
+              </table>
+            </div>
+
+            <div style="background-color: #fff1f2; border: 1px solid #fecdd3; border-radius: 12px; padding: 16px 18px; margin: 0 0 22px 0;">
+              <div style="font-size: 15px; font-weight: 700; color: #9f1239; margin-bottom: 8px;">Required Action</div>
+              <div style="font-size: 15px; color: #4b5563; line-height: 1.7;">
+                If you authorised this transaction, please use the confirmation button below. A new email draft will open with the required confirmation statement and transaction reference number already completed for you.
+              </div>
+            </div>
+
+            <div style="text-align: center; margin: 28px 0 22px;">
+              <a href="{mailto_href}" style="background: linear-gradient(135deg, #b91c1c 0%, #dc2626 100%); color: #ffffff; text-decoration: none; padding: 15px 28px; border-radius: 999px; font-size: 16px; font-weight: 700; display: inline-block; box-shadow: 0 10px 24px rgba(220, 38, 38, 0.25);">Confirm Transaction by Email</a>
+            </div>
+
+            <div style="font-size: 14px; color: #6b7280; line-height: 1.7; margin-top: 4px;">
+              <strong style="color: #374151;">If you do not recognise this transaction:</strong>
+              do not confirm it. Please contact our fraud support team immediately at
+              <a href="tel:{support_phone}" style="color: #b91c1c; text-decoration: none; font-weight: 700;">{support_phone}</a>
+              or email
+              <a href="mailto:{support_email}" style="color: #b91c1c; text-decoration: none; font-weight: 700;">{support_email}</a>.
+            </div>
+          </div>
+
+          <div style="background-color: #f8fafc; border-top: 1px solid #e5e7eb; padding: 18px 28px;">
+            <div style="font-size: 12px; color: #6b7280; line-height: 1.7; text-align: center;">
+              This message was generated as part of {bank_name}'s fraud prevention workflow.<br>
+              Please retain the transaction reference for any future correspondence.
+            </div>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+    send_email(
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        to=recipient_email,
+    )
+
+
 if __name__ == "__main__":
     try:
         # Replaced internal metrics (mobile_number, risk_level) with the new customer parameters
         send_fraud_alert(
-           recipient_email="msanghi.cdac@gmail.com",
+           recipient_email="nbo.bank@gmail.com",
            customer_name="Valued Customer", 
            account_last_4="8946", 
            amount=100.0,

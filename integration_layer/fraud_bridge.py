@@ -36,7 +36,7 @@ CORE_MODEL_DIR = PROJECT_ROOT / "core model"
 if str(CORE_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_MODEL_DIR))
 
-from communication.gmail_sender import send_email, send_fraud_alert
+from communication.gmail_sender import send_email, send_fraud_alert, send_high_risk_confirmation_email
 from communication.whatsapp_sender import send_low_risk_action_required
 from core_model.predict_fraud import FraudPredictor
 
@@ -76,6 +76,14 @@ ML_SIGNAL_LABELS = {
     "device_mismatch":       "Device differs from customer primary device",
     "channel_mismatch":      "Channel differs from customer preferred channel",
 }
+
+
+def _make_transaction_reference(td: dict) -> str:
+    customer_id = str(td.get("customer_id", "CUST")).strip().upper()[-4:] or "CUST"
+    beneficiary_id = str(td.get("beneficiary_id", "BENE")).strip().upper()[-4:] or "BENE"
+    ts_raw = td.get("transaction_timestamp") or datetime.now().isoformat()
+    safe_ts = "".join(ch for ch in str(ts_raw) if ch.isdigit())
+    return f"TXN-{customer_id}-{beneficiary_id}-{safe_ts[-8:] or '00000000'}"
 
 # ── Singleton predictor (loaded once at first call) ───────────────────────────
 _predictor       = None
@@ -300,16 +308,23 @@ def _send_alert_email(result: dict, td: dict, level: str) -> bool:
 
         if level == "High":
             amount_usd = float(td.get("amount_usd", 0))
+            transaction_reference = td.get("transaction_reference") or _make_transaction_reference(td)
+            td["transaction_reference"] = transaction_reference
 
-            send_fraud_alert(
+            send_high_risk_confirmation_email(
                 recipient_email=recipient_email,
                 customer_name=td.get("customer_name", "Valued Customer"),
                 account_last_4=str(td.get("from_account", ""))[-4:],
                 amount=amount_usd,
-                merchant_name=td.get("beneficiary_name", "Unknown Beneficiary"),
+                beneficiary_name=td.get("beneficiary_name", "Unknown Beneficiary"),
                 transaction_date=td.get("transfer_date", str(datetime.now().date())),
+                transaction_reference=transaction_reference,
                 currency="USD",
-                bank_name="National bank of oman - HIGH RISK ALERT",
+                bank_name="National Bank of Oman",
+                beneficiary_country=td.get("beneficiary_country", ""),
+                purpose=td.get("purpose", ""),
+                channel=td.get("channel", ""),
+                support_email=COMPLIANCE_EMAIL,
             )
         elif level == "Medium":
             send_fraud_alert(

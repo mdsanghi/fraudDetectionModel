@@ -733,11 +733,6 @@ elif st.session_state.screen == "dashboard":
         justify-content: flex-end !important;
         padding: 0 12px 0 0 !important;
     }
-    div[data-testid="stHorizontalBlock"] > div:last-child .stButton {
-        display: flex !important;
-        align-items: center !important;
-        height: 100% !important;
-    }
     div[data-testid="stHorizontalBlock"] > div:last-child .stButton > button {
         background: transparent !important;
         color: #1456D8 !important;
@@ -747,10 +742,8 @@ elif st.session_state.screen == "dashboard":
         font-weight: 400 !important;
         padding: 0 !important;
         min-height: unset !important;
-        height: auto !important;
         width: auto !important;
         line-height: 1 !important;
-        align-self: center !important;
     }
     div[data-testid="stHorizontalBlock"] > div:last-child .stButton > button:hover {
         opacity: 0.7 !important;
@@ -788,63 +781,6 @@ elif st.session_state.screen == "beneficiary":
     st.markdown(steps_html(1), unsafe_allow_html=True)
     st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
 
-    st.markdown("""
-    <style>
-    .bene-card {
-        background: white;
-        border-radius: 14px;
-        padding: 14px 14px;
-        border: 1px solid #E5E7EB;
-        transition: all 0.18s ease;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-        margin-bottom: 10px;
-    }
-    .bene-card:hover {
-        border-color: #1456D8;
-        box-shadow: 0 6px 18px rgba(20, 86, 216, 0.10);
-    }
-    .bene-row {
-        display: flex;
-        align-items: stretch;
-        gap: 0;
-    }
-    .bene-row > div[data-testid="stVerticalBlock"] {
-        gap: 0 !important;
-    }
-    div[data-testid="stHorizontalBlock"].bene-cols {
-        gap: 0 !important;
-        align-items: stretch !important;
-    }
-    div[data-testid="stHorizontalBlock"].bene-cols > div:first-child {
-        flex: 1 !important;
-        padding: 0 !important;
-    }
-    div[data-testid="stHorizontalBlock"].bene-cols > div:last-child {
-        flex: 0 0 40px !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: flex-end !important;
-        padding: 0 4px 0 0 !important;
-    }
-    div[data-testid="stHorizontalBlock"].bene-cols > div:last-child .stButton > button {
-        background: transparent !important;
-        color: #1456D8 !important;
-        border: none !important;
-        box-shadow: none !important;
-        font-size: 22px !important;
-        font-weight: 400 !important;
-        padding: 0 !important;
-        min-height: unset !important;
-        width: auto !important;
-        line-height: 1 !important;
-    }
-    div[data-testid="stHorizontalBlock"].bene-cols > div:last-child .stButton > button:hover {
-        opacity: 0.7 !important;
-        background: transparent !important;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
     benefs = st.session_state.customer_beneficiaries or []
 
     search = st.text_input(
@@ -860,15 +796,57 @@ elif st.session_state.screen == "beneficiary":
     if not benefs:
         st.info("No beneficiaries found for this customer.")
 
+    # Match the dashboard UI style for horizontal column blocks
+    st.markdown("""<style>
+    div[data-testid="stHorizontalBlock"] {
+        gap: 0 !important;
+        align-items: stretch !important;
+        background: white;
+        border-bottom: 1px solid #F3F4F6;
+    }
+    div[data-testid="stHorizontalBlock"] > div:first-child {
+        flex: 1 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child {
+        flex: 0 0 48px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-end !important;
+        padding: 0 12px 0 0 !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child .stButton > button {
+        background: transparent !important;
+        color: #1456D8 !important;
+        border: none !important;
+        box-shadow: none !important;
+        font-size: 22px !important;
+        font-weight: 400 !important;
+        padding: 0 !important;
+        min-height: unset !important;
+        width: auto !important;
+        line-height: 1 !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child .stButton > button:hover {
+        opacity: 0.7 !important;
+        background: transparent !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child div[data-testid="stMarkdown"] {
+        display: flex !important;
+        justify-content: flex-end !important;
+        width: 100% !important;
+    }
+    </style>""", unsafe_allow_html=True)
+
     for i, b in enumerate(benefs):
         verified_txt = "Verified" if b.get("is_verified") else "Pending verification"
-        st.markdown('<div class="bene-card">', unsafe_allow_html=True)
         col_a, col_b = st.columns([9, 1])
         with col_a:
+            # Inline background and border removed; UI now relies on the global row CSS
             st.markdown(f"""
-            <div style="padding:4px 0;">
-              <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:6px;">{b['flag']}&nbsp;&nbsp;{b['name']}</div>
-              <div style="font-size:12px;color:#6B7280;margin-bottom:4px;">{b['account']}</div>
+            <div style="padding:14px 16px;">
+              <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:4px;">{b['flag']}&nbsp;&nbsp;{b['name']}</div>
+              <div style="font-size:12px;color:#6B7280;margin-bottom:3px;">{b['account']}</div>
               <div style="font-size:12px;color:#9CA3AF;">{b['bank']} · {b['country']} · {verified_txt}</div>
             </div>""", unsafe_allow_html=True)
         with col_b:
@@ -884,7 +862,6 @@ elif st.session_state.screen == "beneficiary":
                 td["exchange_rate"] = 239.58 if b["country"].strip().lower() == "india" else 1.00
                 st.session_state.selected_beneficiary = b["name"]
                 go("details")
-        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
     st.markdown('<div class="btn-outline">', unsafe_allow_html=True)

@@ -705,31 +705,78 @@ elif st.session_state.screen == "dashboard":
     st.markdown('<div style="padding:8px 0;">', unsafe_allow_html=True)
 
     items = [
-        ("Within My Accounts", "Between any of your NBO Accounts", False),
+        ("Within My Accounts", "Between any of your NBO Accounts", True),
         ("Instant Transfer", "India · UAE · Pakistan · Bangladesh · Philippines · Egypt", True),
-        ("To Other Accounts", "NBO accounts, local banks & worldwide", False),
-        ("Manage Beneficiaries", "Add, edit or remove beneficiaries", False),
-        ("Mobile Payment", "Wallet transfer within NBO", False),
-        ("Scheduled Transfers", "View or cancel pending transfers", False),
-        ("Transfer History", "All past online transfers", False),
-        ("Remittance Alert", "Set up SMS alert for currency rates", False),
+        ("To Other Accounts", "NBO accounts, local banks & worldwide", True),
+        ("Manage Beneficiaries", "Add, edit or remove beneficiaries", True),
+        ("Mobile Payment", "Wallet transfer within NBO", True),
+        ("Scheduled Transfers", "View or cancel pending transfers", True),
+        ("Transfer History", "All past online transfers", True),
+        ("Remittance Alert", "Set up SMS alert for currency rates", True),
     ]
+
+    st.markdown("""<style>
+    div[data-testid="stHorizontalBlock"] {
+        gap: 0 !important;
+        align-items: stretch !important;
+        background: white;
+        border-bottom: 1px solid #F3F4F6;
+    }
+    div[data-testid="stHorizontalBlock"] > div:first-child {
+        flex: 1 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child {
+        flex: 0 0 48px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-end !important;
+        padding: 0 12px 0 0 !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child .stButton {
+        display: flex !important;
+        align-items: center !important;
+        height: 100% !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child .stButton > button {
+        background: transparent !important;
+        color: #1456D8 !important;
+        border: none !important;
+        box-shadow: none !important;
+        font-size: 22px !important;
+        font-weight: 400 !important;
+        padding: 0 !important;
+        min-height: unset !important;
+        height: auto !important;
+        width: auto !important;
+        line-height: 1 !important;
+        align-self: center !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child .stButton > button:hover {
+        opacity: 0.7 !important;
+        background: transparent !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div:last-child div[data-testid="stMarkdown"] {
+        display: flex !important;
+        justify-content: flex-end !important;
+        width: 100% !important;
+    }
+    </style>""", unsafe_allow_html=True)
 
     for idx, (title, sub, clickable) in enumerate(items):
         col_a, col_b = st.columns([9, 1])
         with col_a:
             st.markdown(f"""
-            <div style="background:white;padding:14px 16px;border-bottom:1px solid #F3F4F6;">
+            <div style="padding:14px 16px;">
               <div style="font-size:15px;font-weight:600;color:#111827;">{title}</div>
               <div style="font-size:13px;color:#6B7280;margin-top:3px;">{sub}</div>
             </div>""", unsafe_allow_html=True)
         with col_b:
-            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
             if clickable:
                 if st.button("›", key=f"dash_{idx}"):
                     go("beneficiary")
             else:
-                st.markdown("<div style='text-align:center;font-size:22px;color:#1456D8;padding-top:14px;'>›</div>", unsafe_allow_html=True)
+                st.markdown("<div style='font-size:22px;color:#1456D8;'>›</div>", unsafe_allow_html=True)
 
     footer_nav()
 
@@ -748,75 +795,52 @@ elif st.session_state.screen == "beneficiary":
         border-radius: 14px;
         padding: 14px 14px;
         border: 1px solid #E5E7EB;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
         transition: all 0.18s ease;
         box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-        min-height: 112px;
+        margin-bottom: 10px;
     }
     .bene-card:hover {
         border-color: #1456D8;
         box-shadow: 0 6px 18px rgba(20, 86, 216, 0.10);
-        transform: translateY(-1px);
     }
-    .bene-card-title {
-        font-size: 15px;
-        font-weight: 700;
-        color: #111827;
-        margin-bottom: 6px;
+    .bene-row {
+        display: flex;
+        align-items: stretch;
+        gap: 0;
     }
-    .bene-card-sub {
-        font-size: 12px;
-        color: #6B7280;
-        margin-bottom: 6px;
+    .bene-row > div[data-testid="stVerticalBlock"] {
+        gap: 0 !important;
     }
-    .bene-card-bank {
-        font-size: 12px;
-        color: #9CA3AF;
+    div[data-testid="stHorizontalBlock"].bene-cols {
+        gap: 0 !important;
+        align-items: stretch !important;
     }
-    .bene-chevron {
-        color: #1456D8;
-        font-size: 24px;
-        font-weight: 700;
-        margin-left: 12px;
-        flex-shrink: 0;
-    }
-    .bene-overlay-marker {
-        height: 0 !important;
-        margin: 0 !important;
+    div[data-testid="stHorizontalBlock"].bene-cols > div:first-child {
+        flex: 1 !important;
         padding: 0 !important;
     }
-    .bene-overlay-marker + div[data-testid="element-container"] {
-        margin-top: -112px !important;
-        margin-bottom: 10px !important;
-        position: relative !important;
-        z-index: 10 !important;
+    div[data-testid="stHorizontalBlock"].bene-cols > div:last-child {
+        flex: 0 0 40px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-end !important;
+        padding: 0 4px 0 0 !important;
     }
-    .bene-overlay-marker + div[data-testid="element-container"] .stButton {
-        width: 100% !important;
-    }
-    .bene-overlay-marker + div[data-testid="element-container"] .stButton > button {
-        width: 100% !important;
-        min-height: 112px !important;
-        height: 112px !important;
+    div[data-testid="stHorizontalBlock"].bene-cols > div:last-child .stButton > button {
         background: transparent !important;
-        color: transparent !important;
+        color: #1456D8 !important;
         border: none !important;
         box-shadow: none !important;
-        border-radius: 14px !important;
+        font-size: 22px !important;
+        font-weight: 400 !important;
         padding: 0 !important;
-        margin: 0 !important;
+        min-height: unset !important;
+        width: auto !important;
+        line-height: 1 !important;
     }
-    .bene-overlay-marker + div[data-testid="element-container"] .stButton > button:hover,
-    .bene-overlay-marker + div[data-testid="element-container"] .stButton > button:focus,
-    .bene-overlay-marker + div[data-testid="element-container"] .stButton > button:active {
-        background: rgba(20, 86, 216, 0.02) !important;
-        color: transparent !important;
-        border: none !important;
-        box-shadow: none !important;
-        outline: none !important;
+    div[data-testid="stHorizontalBlock"].bene-cols > div:last-child .stButton > button:hover {
+        opacity: 0.7 !important;
+        background: transparent !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -838,30 +862,29 @@ elif st.session_state.screen == "beneficiary":
 
     for i, b in enumerate(benefs):
         verified_txt = "Verified" if b.get("is_verified") else "Pending verification"
-        st.markdown(f"""
-        <div class="bene-card">
-            <div>
-                <div class="bene-card-title">{b['flag']}&nbsp;&nbsp;{b['name']}</div>
-                <div class="bene-card-sub">{b['account']}</div>
-                <div class="bene-card-bank">{b['bank']} · {b['country']} · {verified_txt}</div>
-            </div>
-            <div class="bene-chevron">›</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown('<div class="bene-overlay-marker"></div>', unsafe_allow_html=True)
-        if st.button(" ", key=f"sel_{i}"):
-            td = st.session_state.transfer_data
-            td["beneficiary_id"] = b["beneficiary_id"]
-            td["beneficiary_name"] = b["name"]
-            td["beneficiary_account"] = b["account"]
-            td["beneficiary_bank"] = b["bank"]
-            td["beneficiary_country"] = b["country"]
-            td["beneficiary_branch"] = b["country"]
-            td["beneficiary_town"] = b["country"]
-            td["exchange_rate"] = 239.58 if b["country"].strip().lower() == "india" else 1.00
-            st.session_state.selected_beneficiary = b["name"]
-            go("details")
+        st.markdown('<div class="bene-card">', unsafe_allow_html=True)
+        col_a, col_b = st.columns([9, 1])
+        with col_a:
+            st.markdown(f"""
+            <div style="padding:4px 0;">
+              <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:6px;">{b['flag']}&nbsp;&nbsp;{b['name']}</div>
+              <div style="font-size:12px;color:#6B7280;margin-bottom:4px;">{b['account']}</div>
+              <div style="font-size:12px;color:#9CA3AF;">{b['bank']} · {b['country']} · {verified_txt}</div>
+            </div>""", unsafe_allow_html=True)
+        with col_b:
+            if st.button("›", key=f"sel_{i}"):
+                td = st.session_state.transfer_data
+                td["beneficiary_id"] = b["beneficiary_id"]
+                td["beneficiary_name"] = b["name"]
+                td["beneficiary_account"] = b["account"]
+                td["beneficiary_bank"] = b["bank"]
+                td["beneficiary_country"] = b["country"]
+                td["beneficiary_branch"] = b["country"]
+                td["beneficiary_town"] = b["country"]
+                td["exchange_rate"] = 239.58 if b["country"].strip().lower() == "india" else 1.00
+                st.session_state.selected_beneficiary = b["name"]
+                go("details")
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
     st.markdown('<div class="btn-outline">', unsafe_allow_html=True)

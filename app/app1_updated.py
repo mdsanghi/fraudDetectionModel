@@ -9,6 +9,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+try:
+    from app.url_qrGenerator import generate_streamlit_network_qr
+except Exception as e:
+    print(f"[app1_updated] QR generator import failed: {e}")
+    generate_streamlit_network_qr = None
+
 # Optional fraud integration
 try:
     from integration_layer.fraud_bridge import run_fraud_check
@@ -19,6 +25,16 @@ except Exception as e:
 st.set_page_config(page_title="NBO Transfer", layout="centered", initial_sidebar_state="collapsed")
 
 DATA_FILE = Path(__file__).parent.parent / "fraud_detection_synthetic_data.xlsx"
+
+if generate_streamlit_network_qr is not None:
+    try:
+        QR_RESULT = generate_streamlit_network_qr()
+        print(f"[app1_updated] Network URL QR generated: {QR_RESULT.qr_path} ({QR_RESULT.url})")
+    except Exception as e:
+        QR_RESULT = None
+        print(f"[app1_updated] Network URL QR generation failed: {e}")
+else:
+    QR_RESULT = None
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────

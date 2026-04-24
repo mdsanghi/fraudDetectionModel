@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sys
+import base64
 from datetime import date, datetime
 from pathlib import Path
 
@@ -25,6 +26,7 @@ except Exception as e:
 st.set_page_config(page_title="NBO Transfer", layout="centered", initial_sidebar_state="collapsed")
 
 DATA_FILE = Path(__file__).parent.parent / "fraud_detection_synthetic_data.xlsx"
+LOGO_FILE = Path(__file__).parent / "nbologo.jpeg"
 
 if generate_streamlit_network_qr is not None:
     try:
@@ -35,6 +37,19 @@ if generate_streamlit_network_qr is not None:
         print(f"[app1_updated] Network URL QR generation failed: {e}")
 else:
     QR_RESULT = None
+
+
+def image_to_data_uri(path: Path) -> str:
+    mime_type = "image/jpeg"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+try:
+    NBO_LOGO_DATA_URI = image_to_data_uri(LOGO_FILE)
+except Exception as e:
+    NBO_LOGO_DATA_URI = ""
+    print(f"[app1_updated] logo load failed: {e}")
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────
@@ -463,10 +478,15 @@ def steps_html(active):
 def top_bar(show_user=False):
     customer_name = st.session_state.transfer_data.get("customer_name", "")
     user_row = f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0 2px;font-size:15px;font-weight:500;color:rgba(255,255,255,.9);"><span>{customer_name}</span><span style="font-size:13px;opacity:.8;">★ Rewards</span></div>' if show_user and customer_name else ""
+    logo_html = (
+        f'<img src="{NBO_LOGO_DATA_URI}" alt="NBO" '
+        'style="display:block;width:154px;height:auto;margin:0 auto 2px;" />'
+        if NBO_LOGO_DATA_URI
+        else '<div style="text-align:center;font-size:42px;font-weight:900;line-height:1.1;letter-spacing:1px;">NBO</div>'
+    )
     st.markdown(f"""
     <div style="background:#1456D8;padding:14px 18px 18px;color:white;">
-      <div style="text-align:center;font-size:13px;font-weight:600;opacity:.85;letter-spacing:.5px;">البنك الوطني العماني</div>
-      <div style="text-align:center;font-size:42px;font-weight:900;line-height:1.1;letter-spacing:1px;">NBO</div>
+      {logo_html}
       {user_row}
     </div>
     """, unsafe_allow_html=True)
@@ -639,12 +659,16 @@ if st.session_state.screen == "login":
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown("""
+    login_logo_html = (
+        f'<img src="{NBO_LOGO_DATA_URI}" alt="NBO" '
+        'style="display:block;width:190px;height:auto;margin:0 auto 18px;" />'
+        if NBO_LOGO_DATA_URI
+        else '<div style="text-align:center;font-size:54px;font-weight:900;line-height:1;letter-spacing:2px;margin-bottom:16px;">NBO</div>'
+    )
+
+    st.markdown(f"""
     <div style="background:transparent;color:white;padding:20px 22px 18px;">
-      <div style="text-align:center;font-size:13px;font-weight:600;opacity:.8;
-           letter-spacing:.5px;margin-bottom:5px;">البنك الوطني العماني</div>
-      <div style="text-align:center;font-size:54px;font-weight:900;line-height:1;
-           letter-spacing:2px;margin-bottom:16px;">NBO</div>
+      {login_logo_html}
       <div style="font-size:21px;font-weight:700;margin-bottom:5px;">Welcome back</div>
       <div style="font-size:15px;opacity:.82;margin-bottom:12px;">Enter customer ID and passcode to continue</div>
       

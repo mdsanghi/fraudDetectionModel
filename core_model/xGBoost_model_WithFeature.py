@@ -70,6 +70,35 @@ os.makedirs(CHARTS_DIR, exist_ok=True)
 TARGET_COL = "label"
 DATETIME_HINTS = ("date", "timestamp", "dob", "birth")
 
+
+def parse_excelish_dates(values) -> pd.Series:
+    """Parse mixed Excel/text date formats, including Excel serial dates."""
+    series = values.copy() if isinstance(values, pd.Series) else pd.Series(values)
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    text = series.astype("string").str.strip()
+    blank_mask = text.isna() | text.eq("") | text.str.lower().isin({"nan", "nat", "none"})
+
+    primary = pd.to_datetime(text.where(~blank_mask), errors="coerce")
+    parsed.loc[primary.notna()] = primary[primary.notna()]
+
+    remaining = parsed.isna() & ~blank_mask
+    if remaining.any():
+        dayfirst = pd.to_datetime(text.where(remaining), errors="coerce", dayfirst=True)
+        parsed.loc[dayfirst.notna()] = dayfirst[dayfirst.notna()]
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    serial_mask = parsed.isna() & numeric.notna() & numeric.between(1, 60000)
+    if serial_mask.any():
+        serial_dates = pd.to_datetime(
+            numeric[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
+        parsed.loc[serial_dates.index] = serial_dates
+
+    return parsed
+
 # Columns to drop: IDs, names, free-text, data-leakage
 DROP_COLS = [
     "transaction_id", "customer_id", "beneficiary_id",
@@ -261,7 +290,7 @@ def build_login_features(df_login):
 def build_beneficiary_features(df_ben):
     """Aggregate beneficiary info — captures verification & recency signals."""
     df_ben = df_ben.copy()
-    df_ben["added_date"] = pd.to_datetime(df_ben["added_date"], errors="coerce")
+    df_ben["added_date"] = parse_excelish_dates(df_ben["added_date"])
 
     agg = df_ben.groupby("customer_id").agg(
         total_beneficiaries=("beneficiary_id", "count"),
@@ -299,7 +328,7 @@ def merge_and_engineer(all_sheets):
 
     # Customer account age
     if "registration_date" in df_cust.columns:
-        df_cust["registration_date"] = pd.to_datetime(df_cust["registration_date"], errors="coerce")
+        df_cust["registration_date"] = parse_excelish_dates(df_cust["registration_date"])
         df_cust["account_age_days"] = (pd.Timestamp.now() - df_cust["registration_date"]).dt.days
 
     login_feat = build_login_features(all_sheets["Login_History"])
@@ -380,6 +409,14 @@ def merge_and_engineer(all_sheets):
         df["new_unverified_ben"] = (
             (df["is_new_beneficiary"] == 1) & (df["has_unverified_ben"] == 1)
         ).astype(int)
+    if "account_age_days" in df.columns:
+        df["account_recent_5d"] = (df["account_age_days"] <= 5).astype(int)
+    if "newest_ben_days" in df.columns:
+        df["beneficiary_recent_5d"] = (df["newest_ben_days"] <= 5).astype(int)
+    if "account_recent_5d" in df.columns and "beneficiary_recent_5d" in df.columns:
+        df["recent_account_and_beneficiary_5d"] = (
+            (df["account_recent_5d"] == 1) & (df["beneficiary_recent_5d"] == 1)
+        ).astype(int)
 
     # ── RULE 11: Recent login location shift ──
     #   login_location_shift from login_feat (already merged)
@@ -393,7 +430,8 @@ def merge_and_engineer(all_sheets):
         "spike_2x", "is_new_device", "is_new_beneficiary", "cross_nat_new_ben",
         "is_high_risk_country", "is_deep_night", "high_login_attempts",
         "no_mfa_high_value", "is_high_risk_customer", "kyc_not_verified",
-        "new_unverified_ben", "login_location_shift", "device_mismatch"
+        "new_unverified_ben", "login_location_shift", "device_mismatch",
+        "account_recent_5d", "beneficiary_recent_5d", "recent_account_and_beneficiary_5d"
     ]
     existing_flags = [f for f in rule_flags if f in df.columns]
     df["fraud_signal_count"] = df[existing_flags].sum(axis=1)
@@ -414,6 +452,7 @@ def merge_and_engineer(all_sheets):
         ("No MFA + high value",    ["no_mfa_high_value", "low_mfa_user", "high_value_txn"]),
         ("Risk tier / KYC",        ["is_high_risk_customer", "kyc_not_verified", "account_not_active"]),
         ("Beneficiary risk",       ["has_unverified_ben", "has_very_recent_ben", "new_unverified_ben"]),
+        ("Fresh account+ben",      ["account_recent_5d", "beneficiary_recent_5d", "recent_account_and_beneficiary_5d"]),
         ("Login location shift",   ["login_location_shift"]),
         ("Compound signal",        ["fraud_signal_count", "multi_signal_alert"]),
     ]
@@ -436,7 +475,7 @@ def coerce_datetime_like_columns(df):
             continue
         if not any(hint in col.lower() for hint in DATETIME_HINTS):
             continue
-        parsed = pd.to_datetime(df[col], errors="coerce")
+        parsed = parse_excelish_dates(df[col])
         if parsed.notna().mean() >= 0.6:
             df[col] = parsed
             converted.append(col)

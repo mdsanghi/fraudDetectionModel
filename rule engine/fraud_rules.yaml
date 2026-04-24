@@ -199,3 +199,14 @@ rules:
     source_sheet: Customers
     required_features:
       - account_age_days
+
+  - id: R22
+    name: fresh_account_and_fresh_beneficiary_5d
+    description: Customer account registration and beneficiary addition are both within the last 5 days.
+    severity: critical
+    score: 45
+    when: account_age_days <= 5 and beneficiary_age_days <= 5
+    source_sheet: Customers+Beneficiaries
+    required_features:
+      - account_age_days
+      - beneficiary_age_days

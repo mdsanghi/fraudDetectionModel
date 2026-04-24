@@ -52,10 +52,43 @@ COMPOSITE_HIGH   = 70
 YAML_HIGH_FLOOR  = 70
 DATETIME_HINTS   = ("date", "timestamp", "dob", "birth")
 
+
+def _parse_excelish_dates(values) -> pd.Series:
+    """Parse mixed Excel/text date formats, including Excel serial dates."""
+    series = values.copy() if isinstance(values, pd.Series) else pd.Series(values)
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    text = series.astype("string").str.strip()
+    blank_mask = text.isna() | text.eq("") | text.str.lower().isin({"nan", "nat", "none"})
+
+    primary = pd.to_datetime(text.where(~blank_mask), errors="coerce")
+    parsed.loc[primary.notna()] = primary[primary.notna()]
+
+    remaining = parsed.isna() & ~blank_mask
+    if remaining.any():
+        dayfirst = pd.to_datetime(text.where(remaining), errors="coerce", dayfirst=True)
+        parsed.loc[dayfirst.notna()] = dayfirst[dayfirst.notna()]
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    serial_mask = parsed.isna() & numeric.notna() & numeric.between(1, 60000)
+    if serial_mask.any():
+        serial_dates = pd.to_datetime(
+            numeric[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
+        parsed.loc[serial_dates.index] = serial_dates
+
+    return parsed
+
+
+def _parse_excelish_date(value):
+    return _parse_excelish_dates(pd.Series([value])).iloc[0]
+
 HIGH_RISK_NATIONALITIES = {"NG", "RU", "CN", "BD"}
 
 # Rules tagged critical — any single fire forces High alarm
-CRITICAL_RULE_IDS = {"R03", "R08", "R16", "R20"}
+CRITICAL_RULE_IDS = {"R03", "R08", "R16", "R20", "R22"}
 
 DROP_COLS = [
     "transaction_id", "customer_id", "beneficiary_id",
@@ -287,8 +320,9 @@ class FraudPredictor:
             self.df_transactions.groupby("customer_id")["amount_usd"].mean().to_dict()
         )
 
-        self.df_customers["registration_date"] = pd.to_datetime(
-            self.df_customers["registration_date"], errors="coerce")
+        self.df_customers["registration_date"] = _parse_excelish_dates(
+            self.df_customers["registration_date"]
+        )
         for cid, row in self._cust_map.items():
             reg = self.df_customers.loc[
                 self.df_customers["customer_id"] == cid, "registration_date"]
@@ -343,7 +377,7 @@ class FraudPredictor:
 
     def _build_beneficiary_features(self):
         df  = self.df_beneficiaries.copy()
-        df["added_date"] = pd.to_datetime(df["added_date"], errors="coerce")
+        df["added_date"] = _parse_excelish_dates(df["added_date"])
         agg = df.groupby("customer_id").agg(
             total_beneficiaries    =("beneficiary_id","count"),
             verified_beneficiaries =("is_verified",   "sum"),
@@ -373,7 +407,7 @@ class FraudPredictor:
                 continue
             if not any(hint in col.lower() for hint in DATETIME_HINTS):
                 continue
-            parsed = pd.to_datetime(df[col], errors="coerce")
+            parsed = _parse_excelish_dates(df[col])
             if parsed.notna().mean() >= 0.6:
                 df[col] = parsed
         return df
@@ -388,8 +422,8 @@ class FraudPredictor:
         txn_dt = txn.get("transaction_date")
         if txn_dt is None:
             txn_dt = now
-        elif isinstance(txn_dt, str):
-            txn_dt = pd.to_datetime(txn_dt, errors="coerce")
+        else:
+            txn_dt = _parse_excelish_date(txn_dt)
             if pd.isna(txn_dt):
                 txn_dt = now
         d["transaction_date"] = str(txn_dt)
@@ -431,8 +465,7 @@ class FraudPredictor:
         # Login attempts last 24 h
         if cid and len(self.df_logins) > 0:
             logs = self.df_logins[self.df_logins["customer_id"] == cid].copy()
-            logs["login_timestamp"] = pd.to_datetime(
-                logs["login_timestamp"], errors="coerce")
+            logs["login_timestamp"] = _parse_excelish_dates(logs["login_timestamp"])
             cutoff = txn_dt - timedelta(hours=24)
             d["login_attempts_before"] = int(len(
                 logs[(logs["login_timestamp"] >= cutoff) &
@@ -444,8 +477,7 @@ class FraudPredictor:
         # Recent login location shift
         if cid and len(self.df_logins) > 0:
             logs = self.df_logins[self.df_logins["customer_id"] == cid].copy()
-            logs["login_timestamp"] = pd.to_datetime(
-                logs["login_timestamp"], errors="coerce")
+            logs["login_timestamp"] = _parse_excelish_dates(logs["login_timestamp"])
             logs = logs[logs["login_timestamp"] <= txn_dt]
             last_log = logs.sort_values("login_timestamp").iloc[-1] if len(logs) > 0 else None
             d["recent_login_new_location"] = int(
@@ -470,7 +502,7 @@ class FraudPredictor:
             added = bene.get("added_date", None)
             if added:
                 try:
-                    added_dt = pd.to_datetime(str(added), errors="coerce")
+                    added_dt = _parse_excelish_date(added)
                     d["beneficiary_age_days"] = int((now - added_dt).days) if not pd.isna(added_dt) else 999
                 except Exception:
                     d["beneficiary_age_days"] = 999
@@ -486,6 +518,12 @@ class FraudPredictor:
         d["customer_risk_tier"]     = str(cust.get("risk_tier", "Low"))
         d["customer_kyc_status"]    = str(cust.get("kyc_status", "Verified"))
         d["customer_account_status"]= str(cust.get("account_status", "Active"))
+        d["account_age_days"] = int(cust.get("account_age_days", 999) or 999)
+        d["account_recent_5d"] = int(d["account_age_days"] <= 5)
+        d["beneficiary_recent_5d"] = int(d["beneficiary_age_days"] <= 5)
+        d["recent_account_and_beneficiary_5d"] = int(
+            d["account_recent_5d"] == 1 and d["beneficiary_recent_5d"] == 1
+        )
 
         return d
 
@@ -542,6 +580,15 @@ class FraudPredictor:
             str(df["kyc_status"].iloc[0]).lower() != "verified" if "kyc_status" in df.columns else False)
         df["account_not_active"] = int(
             str(df["account_status"].iloc[0]).lower() != "active" if "account_status" in df.columns else False)
+        df["account_recent_5d"] = int(
+            float(df["account_age_days"].iloc[0]) <= 5 if "account_age_days" in df.columns else 0
+        )
+        df["beneficiary_recent_5d"] = int(
+            float(df["beneficiary_age_days"].iloc[0]) <= 5 if "beneficiary_age_days" in df.columns else 0
+        )
+        df["recent_account_and_beneficiary_5d"] = int(
+            df["account_recent_5d"].iloc[0] == 1 and df["beneficiary_recent_5d"].iloc[0] == 1
+        )
 
         is_new   = int(df["is_new_beneficiary"].iloc[0]) if "is_new_beneficiary" in df.columns else 0
         has_unv  = int(df["has_unverified_ben"].iloc[0]) if "has_unverified_ben" in df.columns else 0
@@ -552,6 +599,7 @@ class FraudPredictor:
             "is_high_risk_country","is_deep_night","high_login_attempts",
             "no_mfa_high_value","is_high_risk_customer","kyc_not_verified",
             "new_unverified_ben","login_location_shift","device_mismatch",
+            "account_recent_5d","beneficiary_recent_5d","recent_account_and_beneficiary_5d",
         ]
         existing_flags = [f for f in rule_flags if f in df.columns]
         df["fraud_signal_count"] = int(df[existing_flags].fillna(0).sum(axis=1).iloc[0])

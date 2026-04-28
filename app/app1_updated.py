@@ -5,7 +5,6 @@ import base64
 from html import escape
 from datetime import date, datetime
 from pathlib import Path
-from uuid import uuid4
 
 # Ensure the repository root is on sys.path so integration_layer imports work
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -29,16 +28,20 @@ st.set_page_config(page_title="NBO Transfer", layout="centered", initial_sidebar
 
 DATA_FILE = Path(__file__).parent.parent / "fraud_detection_synthetic_data.xlsx"
 LOGO_FILE = Path(__file__).parent / "nbologo.jpeg"
+BACKOFFICE_RELATIVE_URL = "?backoffice=1"
 
 if generate_streamlit_network_qr is not None:
     try:
         QR_RESULT = generate_streamlit_network_qr()
         print(f"[app1_updated] Network URL QR generated: {QR_RESULT.qr_path} ({QR_RESULT.url})")
+        print(f"[app1_updated] Stable back-office URL: {QR_RESULT.url}{BACKOFFICE_RELATIVE_URL}")
     except Exception as e:
         QR_RESULT = None
         print(f"[app1_updated] Network URL QR generation failed: {e}")
+        print(f"[app1_updated] Stable back-office relative URL: {BACKOFFICE_RELATIVE_URL}")
 else:
     QR_RESULT = None
+    print(f"[app1_updated] Stable back-office relative URL: {BACKOFFICE_RELATIVE_URL}")
 
 
 def image_to_data_uri(path: Path) -> str:
@@ -55,26 +58,27 @@ except Exception as e:
 
 
 @st.cache_resource
-def get_backoffice_reviews():
-    return {}
+def get_backoffice_state():
+    return {"latest": None}
 
 
-def publish_backoffice_review(transfer_data: dict, risk_result: dict) -> str:
-    review_id = uuid4().hex[:12]
-    get_backoffice_reviews()[review_id] = {
+def get_backoffice_url() -> str:
+    return BACKOFFICE_RELATIVE_URL
+
+
+def publish_backoffice_review(transfer_data: dict, risk_result: dict) -> None:
+    get_backoffice_state()["latest"] = {
         "transfer_data": dict(transfer_data),
         "risk_result": dict(risk_result),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
-    relative_url = f"?backoffice_id={review_id}"
-    print("\n[app1_updated] BACK OFFICE REVIEW CREATED")
-    print(f"[app1_updated] Review ID: {review_id}")
+    relative_url = get_backoffice_url()
+    print("\n[app1_updated] BACK OFFICE REVIEW UPDATED")
     print(f"[app1_updated] Open manually: {relative_url}")
     if QR_RESULT is not None and getattr(QR_RESULT, "url", None):
         print(f"[app1_updated] Network back-office URL: {QR_RESULT.url}{relative_url}")
     print("[app1_updated] Mobile app flow remains on the customer receipt page.\n")
-    return review_id
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────
@@ -372,16 +376,17 @@ def init_state():
 
 init_state()
 
-backoffice_id_param = st.query_params.get("backoffice_id", "")
-if backoffice_id_param:
-    review = get_backoffice_reviews().get(str(backoffice_id_param))
+backoffice_param = st.query_params.get("backoffice", "")
+if str(backoffice_param).lower() in {"1", "true", "yes"}:
+    review = get_backoffice_state().get("latest")
+    st.session_state.screen = "risk_review"
+    st.session_state.backoffice_review_id = "latest"
     if review:
-        st.session_state.screen = "risk_review"
-        st.session_state.backoffice_review_id = str(backoffice_id_param)
         st.session_state.transfer_data = dict(review["transfer_data"])
         st.session_state.risk_result = dict(review["risk_result"])
     else:
-        print(f"[app1_updated] Back-office review not found: {backoffice_id_param}")
+        st.session_state.backoffice_review_id = ""
+        st.session_state.risk_result = None
 
 # ── Load workbook once ─────────────────────────────────────────────────────────
 try:
@@ -1326,11 +1331,10 @@ elif st.session_state.screen == "otp":
                     print("[app1_updated] RISK RESULT:", st.session_state.risk_result)
                 else:
                     st.session_state.risk_result = compute_risk(st.session_state.transfer_data)
-            if st.session_state.risk_result.get("level") in ("Medium", "High"):
-                st.session_state.backoffice_review_id = publish_backoffice_review(
-                    st.session_state.transfer_data,
-                    st.session_state.risk_result,
-                )
+            publish_backoffice_review(
+                st.session_state.transfer_data,
+                st.session_state.risk_result,
+            )
             go("result")
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1338,6 +1342,20 @@ elif st.session_state.screen == "otp":
 
 
 elif st.session_state.screen == "risk_review":
+    latest_review = get_backoffice_state().get("latest")
+    if not latest_review:
+        st.markdown("""
+        <div style="background:#F8FAFD;border:1px solid #DDE5F2;border-radius:10px;
+                    padding:24px;color:#111827;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+          <div style="font-size:22px;font-weight:800;margin-bottom:8px;">Back Office Transaction Review</div>
+          <div style="font-size:14px;color:#667085;">
+            No transaction has been submitted since this Streamlit program launched.
+            Keep this URL open and refresh it after a transfer is completed.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
     td = st.session_state.transfer_data
     result = st.session_state.risk_result or compute_risk(td)
     level = result.get("level", "Low")
@@ -1370,7 +1388,7 @@ elif st.session_state.screen == "risk_review":
         metric("Risk Level", level),
         metric("Risk Score", result.get("score", "")),
         metric("Amount", f"USD {float(td.get('amount_usd', 0)):,.2f}"),
-        metric("Status", "Review Required"),
+        metric("Status", "Latest Transaction"),
     ])
     transaction_rows_html = "".join([
         detail_row("Customer Name", td.get("customer_name", "")),
@@ -1586,7 +1604,7 @@ elif st.session_state.screen == "risk_review":
         <div>
           <div class="bo-kicker">Back Office Fraud Operations</div>
           <div class="bo-title">Transaction Risk Review</div>
-          <div class="bo-subtitle">Auto-created when a submitted transfer returns a Medium or High risk score.</div>
+          <div class="bo-subtitle">Shows the latest submitted transfer from this running Streamlit program.</div>
         </div>
         <div class="bo-ref">
           <div>Customer: {val('customer_id')}</div>
@@ -1666,7 +1684,7 @@ elif st.session_state.screen == "result":
     #     st.markdown("""
     #     <div style="background:#FFF8E7;border:1px solid #FFE6A0;border-radius:14px;
     #                 padding:12px 14px;margin-bottom:14px;color:#7D4E00;font-size:13px;">
-    #       This transfer has a Medium or High risk score. The back-office review URL has been printed in the Streamlit logs.
+    #       The stable back-office review URL has been printed in the Streamlit logs.
     #     </div>""", unsafe_allow_html=True)
 
     render_transfer_summary(td)

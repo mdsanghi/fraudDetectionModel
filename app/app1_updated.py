@@ -1659,6 +1659,9 @@ elif st.session_state.screen == "result":
 
     render_success_card(td)
 
+    # Manual toggle: comment this line to hide the mobile risk score and triggered rules.
+    render_risk_card(result)
+
     # if level in ("Medium", "High"):
     #     st.markdown("""
     #     <div style="background:#FFF8E7;border:1px solid #FFE6A0;border-radius:14px;

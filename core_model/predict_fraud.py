@@ -52,10 +52,37 @@ COMPOSITE_HIGH   = 70
 YAML_HIGH_FLOOR  = 70
 DATETIME_HINTS   = ("date", "timestamp", "dob", "birth")
 MEDIUM_FLOOR_RULE_IDS = {"R05", "R18", "R21", "R23"}
+EXCEL_DATE_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%m-%d-%Y %H:%M:%S",
+    "%m-%d-%Y %H:%M",
+    "%m-%d-%Y",
+    "%m-%d-%y %H:%M:%S",
+    "%m-%d-%y %H:%M",
+    "%m-%d-%y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y",
+    "%m/%d/%y %H:%M:%S",
+    "%m/%d/%y %H:%M",
+    "%m/%d/%y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M",
+    "%d-%m-%Y",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+)
 
 
 def _parse_excelish_dates(values) -> pd.Series:
-    """Parse mixed Excel/text date formats, including Excel serial dates."""
+    """Parse mixed Excel/text date formats, including Excel serial dates.
+
+    ISO dates are parsed explicitly first so workbook values entered as
+    yyyy-mm-dd are never interpreted through locale-dependent day/month rules.
+    """
     series = values.copy() if isinstance(values, pd.Series) else pd.Series(values)
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, errors="coerce")
@@ -64,12 +91,29 @@ def _parse_excelish_dates(values) -> pd.Series:
     text = series.astype("string").str.strip()
     blank_mask = text.isna() | text.eq("") | text.str.lower().isin({"nan", "nat", "none"})
 
-    primary = pd.to_datetime(text.where(~blank_mask), errors="coerce")
-    parsed.loc[primary.notna()] = primary[primary.notna()]
+    candidates = text.where(~blank_mask)
+    normalized_text = (
+        candidates.str.replace("T", " ", regex=False)
+        .str.replace(r"\.\d+(?=($|[+-]\d{2}:?\d{2}$))", "", regex=True)
+        .str.replace(r"(Z|[+-]\d{2}:?\d{2})$", "", regex=True)
+        .str.strip()
+    )
+
+    for fmt in EXCEL_DATE_FORMATS:
+        remaining = parsed.isna() & ~blank_mask
+        if not remaining.any():
+            break
+        parsed_fmt = pd.to_datetime(normalized_text.where(remaining), format=fmt, errors="coerce")
+        parsed.loc[parsed_fmt.notna()] = parsed_fmt[parsed_fmt.notna()]
 
     remaining = parsed.isna() & ~blank_mask
     if remaining.any():
-        dayfirst = pd.to_datetime(text.where(remaining), errors="coerce", dayfirst=True)
+        primary = pd.to_datetime(normalized_text.where(remaining), errors="coerce")
+        parsed.loc[primary.notna()] = primary[primary.notna()]
+
+    remaining = parsed.isna() & ~blank_mask
+    if remaining.any():
+        dayfirst = pd.to_datetime(normalized_text.where(remaining), errors="coerce", dayfirst=True)
         parsed.loc[dayfirst.notna()] = dayfirst[dayfirst.notna()]
 
     numeric = pd.to_numeric(text, errors="coerce")
@@ -312,6 +356,22 @@ class FraudPredictor:
         self.df_logins        = pd.read_excel(xls, "Login_History")
         self.df_transactions  = pd.read_excel(xls, "Transactions")
 
+        for col in ("date_of_birth", "registration_date"):
+            if col in self.df_customers.columns:
+                self.df_customers[col] = _parse_excelish_dates(self.df_customers[col])
+        if "added_date" in self.df_beneficiaries.columns:
+            self.df_beneficiaries["added_date"] = _parse_excelish_dates(
+                self.df_beneficiaries["added_date"]
+            )
+        if "login_timestamp" in self.df_logins.columns:
+            self.df_logins["login_timestamp"] = _parse_excelish_dates(
+                self.df_logins["login_timestamp"]
+            )
+        if "transaction_date" in self.df_transactions.columns:
+            self.df_transactions["transaction_date"] = _parse_excelish_dates(
+                self.df_transactions["transaction_date"]
+            )
+
         self._cust_map  = self.df_customers.set_index("customer_id").to_dict("index")
         self._bene_map  = self.df_beneficiaries.set_index("beneficiary_id").to_dict("index")
         self._cust_bene = (self.df_beneficiaries
@@ -321,9 +381,6 @@ class FraudPredictor:
             self.df_transactions.groupby("customer_id")["amount_usd"].mean().to_dict()
         )
 
-        self.df_customers["registration_date"] = _parse_excelish_dates(
-            self.df_customers["registration_date"]
-        )
         for cid, row in self._cust_map.items():
             reg = self.df_customers.loc[
                 self.df_customers["customer_id"] == cid, "registration_date"]
@@ -504,7 +561,7 @@ class FraudPredictor:
             if added:
                 try:
                     added_dt = _parse_excelish_date(added)
-                    d["beneficiary_age_days"] = int((now - added_dt).days) if not pd.isna(added_dt) else 999
+                    d["beneficiary_age_days"] = int((txn_dt - added_dt).days) if not pd.isna(added_dt) else 999
                 except Exception:
                     d["beneficiary_age_days"] = 999
             else:
@@ -519,7 +576,11 @@ class FraudPredictor:
         d["customer_risk_tier"]     = str(cust.get("risk_tier", "Low"))
         d["customer_kyc_status"]    = str(cust.get("kyc_status", "Verified"))
         d["customer_account_status"]= str(cust.get("account_status", "Active"))
-        d["account_age_days"] = int(cust.get("account_age_days", 999) or 999)
+        reg_dt = _parse_excelish_date(cust.get("registration_date", None)) if cust else pd.NaT
+        if pd.notna(reg_dt):
+            d["account_age_days"] = int((txn_dt - reg_dt).days)
+        else:
+            d["account_age_days"] = int(cust.get("account_age_days", 999)) if cust.get("account_age_days", None) is not None else 999
         d["account_recent_5d"] = int(d["account_age_days"] <= 5)
         d["beneficiary_recent_5d"] = int(d["beneficiary_age_days"] <= 5)
         d["recent_account_and_beneficiary_5d"] = int(

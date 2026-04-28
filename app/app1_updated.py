@@ -2,8 +2,10 @@ import streamlit as st
 import pandas as pd
 import sys
 import base64
+from html import escape
 from datetime import date, datetime
 from pathlib import Path
+from uuid import uuid4
 
 # Ensure the repository root is on sys.path so integration_layer imports work
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -52,7 +54,100 @@ except Exception as e:
     print(f"[app1_updated] logo load failed: {e}")
 
 
+@st.cache_resource
+def get_backoffice_reviews():
+    return {}
+
+
+def publish_backoffice_review(transfer_data: dict, risk_result: dict) -> str:
+    review_id = uuid4().hex[:12]
+    get_backoffice_reviews()[review_id] = {
+        "transfer_data": dict(transfer_data),
+        "risk_result": dict(risk_result),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    relative_url = f"?backoffice_id={review_id}"
+    print("\n[app1_updated] BACK OFFICE REVIEW CREATED")
+    print(f"[app1_updated] Review ID: {review_id}")
+    print(f"[app1_updated] Open manually: {relative_url}")
+    if QR_RESULT is not None and getattr(QR_RESULT, "url", None):
+        print(f"[app1_updated] Network back-office URL: {QR_RESULT.url}{relative_url}")
+    print("[app1_updated] Mobile app flow remains on the customer receipt page.\n")
+    return review_id
+
+
 # ── Data Loading ───────────────────────────────────────────────────────────────
+EXCEL_DATE_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%m-%d-%Y %H:%M:%S",
+    "%m-%d-%Y %H:%M",
+    "%m-%d-%Y",
+    "%m-%d-%y %H:%M:%S",
+    "%m-%d-%y %H:%M",
+    "%m-%d-%y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y",
+    "%m/%d/%y %H:%M:%S",
+    "%m/%d/%y %H:%M",
+    "%m/%d/%y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M",
+    "%d-%m-%Y",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+)
+
+
+def parse_excel_dates(values) -> pd.Series:
+    """Parse workbook dates stored as ISO text, Excel dates, or manual edits."""
+    series = values.copy() if isinstance(values, pd.Series) else pd.Series(values)
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    text = series.astype("string").str.strip()
+    blank_mask = text.isna() | text.eq("") | text.str.lower().isin({"nan", "nat", "none"})
+    candidates = text.where(~blank_mask)
+    normalized_text = (
+        candidates.str.replace("T", " ", regex=False)
+        .str.replace(r"\.\d+(?=($|[+-]\d{2}:?\d{2}$))", "", regex=True)
+        .str.replace(r"(Z|[+-]\d{2}:?\d{2})$", "", regex=True)
+        .str.strip()
+    )
+
+    for fmt in EXCEL_DATE_FORMATS:
+        remaining = parsed.isna() & ~blank_mask
+        if not remaining.any():
+            break
+        parsed_fmt = pd.to_datetime(normalized_text.where(remaining), format=fmt, errors="coerce")
+        parsed.loc[parsed_fmt.notna()] = parsed_fmt[parsed_fmt.notna()]
+
+    remaining = parsed.isna() & ~blank_mask
+    if remaining.any():
+        fallback = pd.to_datetime(normalized_text.where(remaining), errors="coerce")
+        parsed.loc[fallback.notna()] = fallback[fallback.notna()]
+
+    remaining = parsed.isna() & ~blank_mask
+    if remaining.any():
+        dayfirst = pd.to_datetime(normalized_text.where(remaining), errors="coerce", dayfirst=True)
+        parsed.loc[dayfirst.notna()] = dayfirst[dayfirst.notna()]
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    serial_mask = parsed.isna() & numeric.notna() & numeric.between(1, 60000)
+    if serial_mask.any():
+        serial_dates = pd.to_datetime(
+            numeric[serial_mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
+        parsed.loc[serial_dates.index] = serial_dates
+
+    return parsed
+
+
 @st.cache_data
 def load_workbook(path_str: str):
     path = Path(path_str)
@@ -71,6 +166,17 @@ def load_workbook(path_str: str):
 
     if "beneficiary_id" in transactions.columns:
         transactions["beneficiary_id"] = transactions["beneficiary_id"].astype(str).str.strip()
+
+    if "date_of_birth" in customers.columns:
+        customers["date_of_birth"] = parse_excel_dates(customers["date_of_birth"])
+    if "registration_date" in customers.columns:
+        customers["registration_date"] = parse_excel_dates(customers["registration_date"])
+    if "added_date" in beneficiaries.columns:
+        beneficiaries["added_date"] = parse_excel_dates(beneficiaries["added_date"])
+    if "transaction_date" in transactions.columns:
+        transactions["transaction_date"] = parse_excel_dates(transactions["transaction_date"])
+    if "login_timestamp" in login_history.columns:
+        login_history["login_timestamp"] = parse_excel_dates(login_history["login_timestamp"])
 
     return customers, beneficiaries, transactions, login_history
 
@@ -148,6 +254,10 @@ def build_transfer_data(customer_row: pd.Series, beneficiary_row: pd.Series | No
         "preferred_channel": preferred_channel,
         "channel": preferred_channel,
         "device_used": primary_device,
+        "customer_phone": str(customer_row.get("phone", "")),
+        "phone": str(customer_row.get("phone", "")),
+        "customer_email": str(customer_row.get("email", "")),
+        "email": str(customer_row.get("email", "")),
     }
 
 
@@ -162,7 +272,7 @@ def get_customer_bundle(customer_id: str, customers_df: pd.DataFrame, beneficiar
     customer_beneficiaries = beneficiaries_df[beneficiaries_df["customer_id"] == cid].copy()
 
     if not customer_beneficiaries.empty:
-        customer_beneficiaries["added_date_dt"] = pd.to_datetime(customer_beneficiaries["added_date"], errors="coerce")
+        customer_beneficiaries["added_date_dt"] = parse_excel_dates(customer_beneficiaries["added_date"])
         customer_beneficiaries = customer_beneficiaries.sort_values(["added_date_dt", "beneficiary_name"], ascending=[False, True])
         first_beneficiary = customer_beneficiaries.iloc[0]
     else:
@@ -246,9 +356,13 @@ def init_state():
             "kyc_status": "",
             "account_status": "",
             "preferred_channel": "",
-            "channel": "",
-            "device_used": "",
-        },
+        "channel": "",
+        "device_used": "",
+        "customer_phone": "",
+        "phone": "",
+        "customer_email": "",
+        "email": "",
+    },
         "risk_result": None,
         "login_error": "",
     }
@@ -257,6 +371,17 @@ def init_state():
             st.session_state[k] = v
 
 init_state()
+
+backoffice_id_param = st.query_params.get("backoffice_id", "")
+if backoffice_id_param:
+    review = get_backoffice_reviews().get(str(backoffice_id_param))
+    if review:
+        st.session_state.screen = "risk_review"
+        st.session_state.backoffice_review_id = str(backoffice_id_param)
+        st.session_state.transfer_data = dict(review["transfer_data"])
+        st.session_state.risk_result = dict(review["risk_result"])
+    else:
+        print(f"[app1_updated] Back-office review not found: {backoffice_id_param}")
 
 # ── Load workbook once ─────────────────────────────────────────────────────────
 try:
@@ -449,6 +574,42 @@ div[data-testid="stAlert"] {
 </style>
 """, unsafe_allow_html=True)
 
+if st.session_state.screen == "risk_review":
+    st.markdown("""
+    <style>
+    html, body, [data-testid="stAppViewContainer"], .stApp, section[data-testid="stMain"] {
+        height: auto !important;
+        min-height: 100vh !important;
+        background: #F3F6FB !important;
+    }
+    .block-container {
+        max-width: 1180px !important;
+        width: min(1180px, calc(100vw - 40px)) !important;
+        min-height: auto !important;
+        height: auto !important;
+        padding: 0 !important;
+        margin: 24px auto !important;
+        background: transparent !important;
+        border: none !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+        overflow: visible !important;
+    }
+    .block-container > div:first-child,
+    .block-container > div:last-child {
+        border-radius: 0 !important;
+        overflow: visible !important;
+    }
+    @media (max-width: 480px) {
+        .block-container {
+            width: 100vw !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def go(screen):
     st.session_state.screen = screen
@@ -511,6 +672,79 @@ def row_pair(label, value):
 
 def blue_band(text):
     st.markdown(f'<div style="background:#1456D8;color:white;padding:9px 14px;font-size:14px;font-weight:600;border-radius:12px 12px 0 0;margin-top:10px;">{text}</div>', unsafe_allow_html=True)
+
+RISK_STYLES = {
+    "Low": ("✅", "#E7F6EF", "#12805C", "#C6EDD9"),
+    "Medium": ("⚠️", "#FFF8E7", "#A96900", "#FFE6A0"),
+    "High": ("🚨", "#FDECEC", "#B42318", "#FDBDBA"),
+}
+
+def render_success_card(td):
+    st.markdown(f"""
+    <div style="background:#E7F6EF;border-radius:14px;padding:14px;margin-bottom:14px;
+                border:1px solid #C6EDD9;text-align:center;">
+      <div style="font-size:28px;">✓</div>
+      <div style="font-size:16px;font-weight:700;color:#12805C;margin-top:4px;">Transfer Submitted Successfully</div>
+      <div style="font-size:13px;color:#374151;margin-top:4px;">USD {td['amount_usd']:,.2f} → {td['beneficiary_name']}</div>
+    </div>""", unsafe_allow_html=True)
+
+def render_risk_card(result):
+    level = result["level"]
+    icon, bg, fg, border = RISK_STYLES.get(level, RISK_STYLES["Low"])
+    st.markdown(f"""
+    <div style="background:{bg};border:1.5px solid {border};border-radius:14px;
+                padding:14px 16px;margin-bottom:14px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+        <span style="font-size:22px;">{icon}</span>
+        <span style="font-size:17px;font-weight:700;color:{fg};">{level} Suspicion</span>
+        <span style="margin-left:auto;background:{border};color:{fg};font-size:13px;
+                     font-weight:700;padding:3px 10px;border-radius:20px;">Score: {result['score']}</span>
+      </div>
+      {"".join(f'<div style="font-size:13px;color:{fg};margin-top:4px;">• {t}</div>' for t in result["triggered"])}
+    </div>""", unsafe_allow_html=True)
+
+def render_transfer_summary(td):
+    blue_band("Transfer Summary")
+    st.markdown(f"""
+    <div style="background:white;border:1px solid #E5E7EB;border-top:none;
+                border-radius:0 0 14px 14px;padding:4px 14px 10px;margin-bottom:14px;">
+      {row_pair("Customer", td.get('customer_name', ''))}
+      {row_pair("Beneficiary", td['beneficiary_name'])}
+      {row_pair("Amount", f"USD {td['amount_usd']:,.2f}")}
+      {row_pair("Country", td['beneficiary_country'])}
+      {row_pair("Purpose", td['purpose'])}
+      {row_pair("Date", td['transfer_date'])}
+    </div>""", unsafe_allow_html=True)
+
+def render_customer_details(td):
+    blue_band("Customer Details")
+    st.markdown(f"""
+    <div style="background:white;border:1px solid #E5E7EB;border-top:none;
+                border-radius:0 0 14px 14px;padding:4px 14px 10px;margin-bottom:14px;">
+      {row_pair("Customer ID", td.get('customer_id', ''))}
+      {row_pair("Name", td.get('customer_name', ''))}
+      {row_pair("Account", td.get('from_account', ''))}
+      {row_pair("Account Name", td.get('from_account_name', ''))}
+      {row_pair("Risk Tier", td.get('risk_tier', ''))}
+      {row_pair("KYC", td.get('kyc_status', ''))}
+      {row_pair("Status", td.get('account_status', ''))}
+      {row_pair("Residence", td.get('country_of_residence', ''))}
+      {row_pair("Channel", td.get('channel', ''))}
+      {row_pair("Device", td.get('device_used', ''))}
+    </div>""", unsafe_allow_html=True)
+
+def render_beneficiary_details(td):
+    blue_band("Beneficiary Details")
+    st.markdown(f"""
+    <div style="background:white;border:1px solid #E5E7EB;border-top:none;
+                border-radius:0 0 14px 14px;padding:4px 14px 10px;margin-bottom:14px;">
+      {row_pair("Beneficiary ID", td.get('beneficiary_id', ''))}
+      {row_pair("Name", td.get('beneficiary_name', ''))}
+      {row_pair("Account No.", td.get('beneficiary_account', ''))}
+      {row_pair("Bank", td.get('beneficiary_bank', ''))}
+      {row_pair("Country", td.get('beneficiary_country', ''))}
+      {row_pair("Town", td.get('beneficiary_town', ''))}
+    </div>""", unsafe_allow_html=True)
 
 def compute_risk(data):
     score = 0
@@ -1092,10 +1326,326 @@ elif st.session_state.screen == "otp":
                     print("[app1_updated] RISK RESULT:", st.session_state.risk_result)
                 else:
                     st.session_state.risk_result = compute_risk(st.session_state.transfer_data)
+            if st.session_state.risk_result.get("level") in ("Medium", "High"):
+                st.session_state.backoffice_review_id = publish_backoffice_review(
+                    st.session_state.transfer_data,
+                    st.session_state.risk_result,
+                )
             go("result")
         st.markdown('</div>', unsafe_allow_html=True)
 
     footer_nav()
+
+
+elif st.session_state.screen == "risk_review":
+    td = st.session_state.transfer_data
+    result = st.session_state.risk_result or compute_risk(td)
+    level = result.get("level", "Low")
+    _, _, risk_color, risk_border = RISK_STYLES.get(level, RISK_STYLES["Low"])
+
+    def val(key, fallback=""):
+        return escape(str(td.get(key, fallback) or ""))
+
+    def metric(label, value):
+        return (
+            f'<div class="bo-metric">'
+            f'<div class="bo-metric-label">{escape(str(label))}</div>'
+            f'<div class="bo-metric-value">{escape(str(value))}</div>'
+            f'</div>'
+        )
+
+    def detail_row(label, value):
+        return (
+            f'<div class="bo-row">'
+            f'<span>{escape(str(label))}</span>'
+            f'<strong>{escape(str(value or ""))}</strong>'
+            f'</div>'
+        )
+
+    rules_html = "".join(
+        f'<li>{escape(str(rule))}</li>'
+        for rule in result.get("triggered", [])
+    )
+    metrics_html = "".join([
+        metric("Risk Level", level),
+        metric("Risk Score", result.get("score", "")),
+        metric("Amount", f"USD {float(td.get('amount_usd', 0)):,.2f}"),
+        metric("Status", "Review Required"),
+    ])
+    transaction_rows_html = "".join([
+        detail_row("Customer Name", td.get("customer_name", "")),
+        detail_row("From Account", td.get("from_account", "")),
+        detail_row("Account Name", td.get("from_account_name", "")),
+        detail_row("Beneficiary Name", td.get("beneficiary_name", "")),
+        detail_row("Beneficiary Account", td.get("beneficiary_account", "")),
+        detail_row("Beneficiary Bank", td.get("beneficiary_bank", "")),
+        detail_row("Beneficiary Country", td.get("beneficiary_country", "")),
+        detail_row("Amount", f"USD {float(td.get('amount_usd', 0)):,.2f}"),
+        detail_row("Purpose", td.get("purpose", "")),
+        detail_row("Transfer Type", td.get("transfer_type", "")),
+        detail_row("Transfer Date", td.get("transfer_date", "")),
+    ])
+    customer_rows_html = "".join([
+        detail_row("Customer ID", td.get("customer_id", "")),
+        detail_row("Name", td.get("customer_name", "")),
+        detail_row("Risk Tier", td.get("risk_tier", "")),
+        detail_row("KYC Status", td.get("kyc_status", "")),
+        detail_row("Account Status", td.get("account_status", "")),
+        detail_row("Residence", td.get("country_of_residence", "")),
+        detail_row("Phone", td.get("customer_phone") or td.get("phone", "")),
+        detail_row("Email", td.get("customer_email") or td.get("email", "")),
+        detail_row("Preferred Channel", td.get("preferred_channel", "")),
+        detail_row("Transaction Channel", td.get("channel", "")),
+        detail_row("Device Used", td.get("device_used", "")),
+    ])
+    beneficiary_rows_html = "".join([
+        detail_row("Beneficiary ID", td.get("beneficiary_id", "")),
+        detail_row("Name", td.get("beneficiary_name", "")),
+        detail_row("Bank", td.get("beneficiary_bank", "")),
+        detail_row("Country", td.get("beneficiary_country", "")),
+        detail_row("Town", td.get("beneficiary_town", "")),
+    ])
+
+    st.markdown("""
+    <style>
+    .bo-page {
+        color: #111827;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        padding-bottom: 24px;
+    }
+    .bo-topbar {
+        background: #0F2748;
+        color: white;
+        padding: 18px 22px;
+        border-radius: 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 18px;
+        margin-bottom: 16px;
+    }
+    .bo-kicker {
+        color: #93B4E8;
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 5px;
+    }
+    .bo-title {
+        font-size: 24px;
+        font-weight: 800;
+        line-height: 1.2;
+    }
+    .bo-subtitle {
+        font-size: 14px;
+        color: rgba(255,255,255,0.76);
+        margin-top: 5px;
+    }
+    .bo-ref {
+        text-align: right;
+        color: rgba(255,255,255,0.78);
+        font-size: 12px;
+        line-height: 1.7;
+    }
+    .bo-metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+    .bo-metric {
+        background: white;
+        border: 1px solid #DDE5F2;
+        border-radius: 8px;
+        padding: 14px 16px;
+        min-height: 78px;
+    }
+    .bo-metric-label {
+        color: #667085;
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 8px;
+    }
+    .bo-metric-value {
+        color: #111827;
+        font-size: 20px;
+        font-weight: 800;
+        line-height: 1.2;
+    }
+    .bo-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(340px, 0.8fr);
+        gap: 16px;
+        align-items: start;
+    }
+    .bo-panel {
+        background: white;
+        border: 1px solid #DDE5F2;
+        border-radius: 8px;
+        overflow: hidden;
+        margin-bottom: 16px;
+    }
+    .bo-panel-title {
+        background: #F8FAFD;
+        border-bottom: 1px solid #E6ECF5;
+        color: #1F2937;
+        font-size: 14px;
+        font-weight: 800;
+        padding: 12px 14px;
+    }
+    .bo-panel-body {
+        padding: 6px 14px 12px;
+    }
+    .bo-row {
+        display: grid;
+        grid-template-columns: 190px minmax(0, 1fr);
+        gap: 14px;
+        padding: 10px 0;
+        border-bottom: 1px solid #F0F3F8;
+        font-size: 13px;
+    }
+    .bo-row:last-child {
+        border-bottom: 0;
+    }
+    .bo-row span {
+        color: #667085;
+        font-weight: 600;
+    }
+    .bo-row strong {
+        color: #111827;
+        font-weight: 700;
+        overflow-wrap: anywhere;
+    }
+    .bo-risk-panel {
+        border-top: 5px solid var(--risk-color);
+    }
+    .bo-score {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 16px 14px;
+        border-bottom: 1px solid #F0F3F8;
+    }
+    .bo-score-name {
+        color: var(--risk-color);
+        font-size: 22px;
+        font-weight: 900;
+    }
+    .bo-score-pill {
+        background: var(--risk-bg);
+        color: var(--risk-color);
+        border: 1px solid var(--risk-border);
+        border-radius: 999px;
+        padding: 7px 13px;
+        font-size: 14px;
+        font-weight: 900;
+        white-space: nowrap;
+    }
+    .bo-rule-list {
+        margin: 0;
+        padding: 6px 18px 16px 34px;
+        color: #B42318;
+        font-size: 14px;
+        line-height: 1.55;
+    }
+    .bo-rule-list li {
+        margin: 8px 0;
+    }
+    .bo-actions {
+        max-width: 360px;
+        margin-top: 4px;
+    }
+    @media (max-width: 820px) {
+        .bo-topbar {
+            display: block;
+        }
+        .bo-ref {
+            text-align: left;
+            margin-top: 12px;
+        }
+        .bo-metrics,
+        .bo-grid,
+        .bo-actions {
+            grid-template-columns: 1fr;
+        }
+        .bo-row {
+            grid-template-columns: 1fr;
+            gap: 3px;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.html(f"""
+    <div class="bo-page" style="--risk-color:{risk_color};--risk-border:{risk_border};--risk-bg:{risk_border}55;">
+      <div class="bo-topbar">
+        <div>
+          <div class="bo-kicker">Back Office Fraud Operations</div>
+          <div class="bo-title">Transaction Risk Review</div>
+          <div class="bo-subtitle">Auto-created when a submitted transfer returns a Medium or High risk score.</div>
+        </div>
+        <div class="bo-ref">
+          <div>Customer: {val('customer_id')}</div>
+          <div>Beneficiary: {val('beneficiary_id')}</div>
+          <div>Date: {val('transfer_date')}</div>
+        </div>
+      </div>
+
+      <div class="bo-metrics">
+        {metrics_html}
+      </div>
+
+      <div class="bo-grid">
+        <div>
+          <div class="bo-panel bo-risk-panel">
+            <div class="bo-panel-title">Risk Score and Triggered Rules</div>
+            <div class="bo-score">
+              <div class="bo-score-name">{escape(level)} Suspicion</div>
+              <div class="bo-score-pill">Score: {escape(str(result.get("score", "")))}</div>
+            </div>
+            <ul class="bo-rule-list">{rules_html}</ul>
+          </div>
+
+          <div class="bo-panel">
+            <div class="bo-panel-title">Transaction Details</div>
+            <div class="bo-panel-body">
+              {transaction_rows_html}
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="bo-panel">
+            <div class="bo-panel-title">Customer Profile</div>
+            <div class="bo-panel-body">
+              {customer_rows_html}
+            </div>
+          </div>
+
+          <div class="bo-panel">
+            <div class="bo-panel-title">Beneficiary Profile</div>
+            <div class="bo-panel-body">
+              {beneficiary_rows_html}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    """)
+
+    st.markdown('<div class="bo-actions">', unsafe_allow_html=True)
+    if st.button("Call Customer", key="risk_call_customer"):
+        customer_phone = td.get("customer_phone") or td.get("phone") or "phone number unavailable"
+        customer_name = td.get("customer_name") or td.get("customer_id") or "customer"
+        st.session_state.backoffice_call_message = f"Call requested for {customer_name}: {customer_phone}"
+        print(f"[app1_updated] Back-office call requested: {customer_name} | {customer_phone}")
+    if st.session_state.get("backoffice_call_message"):
+        st.success(st.session_state.backoffice_call_message)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 elif st.session_state.screen == "result":
@@ -1103,48 +1653,20 @@ elif st.session_state.screen == "result":
     result = st.session_state.risk_result or compute_risk(td)
     level = result["level"]
 
-    risk_styles = {
-        "Low": ("✅", "#E7F6EF", "#12805C", "#C6EDD9"),
-        "Medium": ("⚠️", "#FFF8E7", "#A96900", "#FFE6A0"),
-        "High": ("🚨", "#FDECEC", "#B42318", "#FDBDBA"),
-    }
-    icon, bg, fg, border = risk_styles[level]
-
     top_bar(show_user=True)
     section_title("Transfer Initiated")
     st.markdown('<div style="padding:16px;">', unsafe_allow_html=True)
 
-    st.markdown(f"""
-    <div style="background:#E7F6EF;border-radius:14px;padding:14px;margin-bottom:14px;
-                border:1px solid #C6EDD9;text-align:center;">
-      <div style="font-size:28px;">✓</div>
-      <div style="font-size:16px;font-weight:700;color:#12805C;margin-top:4px;">Transfer Submitted Successfully</div>
-      <div style="font-size:13px;color:#374151;margin-top:4px;">USD {td['amount_usd']:,.2f} → {td['beneficiary_name']}</div>
-    </div>""", unsafe_allow_html=True)
+    render_success_card(td)
 
-    st.markdown(f"""
-    <div style="background:{bg};border:1.5px solid {border};border-radius:14px;
-                padding:14px 16px;margin-bottom:14px;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-        <span style="font-size:22px;">{icon}</span>
-        <span style="font-size:17px;font-weight:700;color:{fg};">{level} Suspicion</span>
-        <span style="margin-left:auto;background:{border};color:{fg};font-size:13px;
-                     font-weight:700;padding:3px 10px;border-radius:20px;">Score: {result['score']}</span>
-      </div>
-      {"".join(f'<div style="font-size:13px;color:{fg};margin-top:4px;">• {t}</div>' for t in result["triggered"])}
-    </div>""", unsafe_allow_html=True)
+    # if level in ("Medium", "High"):
+    #     st.markdown("""
+    #     <div style="background:#FFF8E7;border:1px solid #FFE6A0;border-radius:14px;
+    #                 padding:12px 14px;margin-bottom:14px;color:#7D4E00;font-size:13px;">
+    #       This transfer has a Medium or High risk score. The back-office review URL has been printed in the Streamlit logs.
+    #     </div>""", unsafe_allow_html=True)
 
-    blue_band("Transfer Summary")
-    st.markdown(f"""
-    <div style="background:white;border:1px solid #E5E7EB;border-top:none;
-                border-radius:0 0 14px 14px;padding:4px 14px 10px;margin-bottom:14px;">
-      {row_pair("Customer", td.get('customer_name', ''))}
-      {row_pair("Beneficiary", td['beneficiary_name'])}
-      {row_pair("Amount", f"USD {td['amount_usd']:,.2f}")}
-      {row_pair("Country", td['beneficiary_country'])}
-      {row_pair("Purpose", td['purpose'])}
-      {row_pair("Date", td['transfer_date'])}
-    </div>""", unsafe_allow_html=True)
+    render_transfer_summary(td)
 
     c1, c2 = st.columns(2)
     with c1:
